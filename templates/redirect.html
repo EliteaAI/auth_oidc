@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <meta name="description" content="OIDC HTTP Post Request">
+    <meta name="author" content="Carrier Auth OIDC">
+    <title>OIDC HTTP Post Request</title>
+  </head>
+  <body onload="document.forms[0].submit()">
+    <form action="{{ action }}" method="post">
+      {% for item in parameters %}
+      <input type="hidden" name="{{ item.name }}" value="{{ item.value }}">
+      {% endfor %}
+      <noscript>
+        <p>Please click the button below to continue.</p>
+        <input type="submit" value="Click here to continue">
+      </noscript>
+    </form>
+  </body>
+</html>

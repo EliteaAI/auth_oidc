@@ -1,0 +1,37 @@
+{
+  "$schema": "https://elitea.ai/admin-config-schema/v1",
+  "plugin": "auth_oidc",
+  "properties": {
+    "oidc_metadata_endpoint": {
+      "type": "string",
+      "title": "OIDC Metadata Endpoint",
+      "description": "The OpenID Connect discovery endpoint URL (e.g. https://idp.example.com/.well-known/openid-configuration).",
+      "path": "metadata_endpoint",
+      "section": "auth",
+      "default": "",
+      "requires_restart": true,
+      "visible_when": { "field": "auth_provider", "value": "oidc" }
+    },
+    "oidc_client_id": {
+      "type": "string",
+      "title": "OIDC Client ID",
+      "description": "The client identifier registered with the identity provider.",
+      "path": "client_id",
+      "section": "auth",
+      "default": "",
+      "requires_restart": true,
+      "visible_when": { "field": "auth_provider", "value": "oidc" }
+    },
+    "oidc_client_secret": {
+      "type": "string",
+      "format": "password",
+      "title": "OIDC Client Secret",
+      "description": "The client secret for authenticating with the identity provider.",
+      "path": "client_secret",
+      "section": "auth",
+      "default": "",
+      "requires_restart": true,
+      "visible_when": { "field": "auth_provider", "value": "oidc" }
+    }
+  }
+}

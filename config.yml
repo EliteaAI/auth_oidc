@@ -1,0 +1,11 @@
+# url_prefix: "/oidc"
+
+authorization_endpoint: ""
+token_endpoint: ""
+userinfo_endpoint: ""
+end_session_endpoint: ""
+
+client_id: ""
+client_secret: ""
+
+# issuer: ""
