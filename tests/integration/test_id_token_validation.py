@@ -333,3 +333,16 @@ def test_the_allow_flag_must_be_true_not_just_present(build_module):
         build_module(allow_unverified_id_token=False).init()
     with pytest.raises(RuntimeError):
         build_module(allow_unverified_id_token="no").init()
+
+
+def test_metadata_endpoint_alone_discovers_and_enforces_the_document_issuer(
+        build_module, signing_key, discovery, jwks):
+    subject = build_module(metadata_endpoint="https://login.example.com/meta")
+    assert subject.get_id_token_source() == "discovery"
+    subject.check_id_token_config()  # no refusal: the metadata endpoint is a key source
+
+    assert decode(subject, make_token(signing_key))["iss"] == ISSUER
+    assert discovery.urls == ["https://login.example.com/meta"]
+
+    with pytest.raises(Exception):
+        decode(subject, make_token(signing_key, iss="https://evil.example.com"))

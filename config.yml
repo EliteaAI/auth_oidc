@@ -16,7 +16,8 @@ client_secret: ""
 #   jwt_public_key  - PEM public key
 #   jwks_uri        - JWKS document URL
 #   issuer          - discovery: {issuer}/.well-known/openid-configuration
-#                     (or metadata_endpoint when set), requires issuer
+#   metadata_endpoint - discovery from that URL; the document's issuer is adopted
+#                     and enforced on the token (set issuer too to pin it)
 # audience is always client_id; when issuer is set the token's iss must equal it.
 # issuer: ""
 # jwks_uri: ""

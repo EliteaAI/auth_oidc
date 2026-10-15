@@ -75,6 +75,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
         """ Forget discovered key locations and key clients (config may have changed) """
         self.jwk_clients = {}
         self.discovered_jwks_uri = None
+        self.discovered_issuer = None
 
     @web.method()
     def get_id_token_source(self):
@@ -85,7 +86,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
             return "public_key"
         if config.get("jwks_uri"):
             return "jwks_uri"
-        if config.get("issuer"):
+        if config.get("issuer") or (config.get("metadata_endpoint") or "").strip():
             return "discovery"
         return None
 
@@ -120,7 +121,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
             return config["jwks_uri"]
         #
         if self.discovered_jwks_uri is None:
-            issuer = config["issuer"]
+            issuer = config.get("issuer")
             url = (config.get("metadata_endpoint") or "").strip() \
                 or issuer.rstrip("/") + DISCOVERY_PATH
             #
@@ -130,12 +131,18 @@ class Method:  # pylint: disable=E1101,R0903,W0201
             response.raise_for_status()
             document = response.json()
             #
-            if not isinstance(document, dict) or document.get("issuer") != issuer:
+            if not isinstance(document, dict) or not isinstance(document.get("issuer"), str) \
+                    or not document["issuer"]:
+                raise ValueError("Discovery document has no issuer")
+            # With issuer configured the document must agree; with metadata_endpoint
+            # alone (an operator-configured HTTPS URL) the document's issuer is adopted
+            if issuer and document["issuer"] != issuer:
                 raise ValueError("Discovery document issuer does not match the configured issuer")
             if not isinstance(document.get("jwks_uri"), str) or not document["jwks_uri"]:
                 raise ValueError("Discovery document has no jwks_uri")
             #
             self.discovered_jwks_uri = document["jwks_uri"]
+            self.discovered_issuer = document["issuer"]
         #
         return self.discovered_jwks_uri
 
@@ -170,12 +177,13 @@ class Method:  # pylint: disable=E1101,R0903,W0201
             log.error("ID token is NOT verified (allow_unverified_id_token is set)")
             id_data = jwt.decode(id_token, options={"verify_signature": False})
         else:
+            key = self.get_id_token_key(id_token, source)  # discovery runs here
             id_data = jwt.decode(
                 id_token,
-                self.get_id_token_key(id_token, source),
+                key,
                 algorithms=ALGORITHMS,
                 audience=config["client_id"],
-                issuer=config.get("issuer") or None,
+                issuer=config.get("issuer") or self.discovered_issuer or None,
                 leeway=int(config.get("leeway", DEFAULT_LEEWAY)),
                 options={"require": REQUIRED_CLAIMS},
             )
