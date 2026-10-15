@@ -8,4 +8,22 @@ end_session_endpoint: ""
 client_id: ""
 client_secret: ""
 
+# Scopes requested at login. Add offline_access (refresh token) and the
+# middle-tier ".default" scope when the platform needs to act on the user's behalf.
+# scope: "openid profile email"
+
+# ID token verification. Keys come from the first of these that is set:
+#   jwt_public_key  - PEM public key
+#   jwks_uri        - JWKS document URL
+#   issuer          - discovery: {issuer}/.well-known/openid-configuration
+#   metadata_endpoint - discovery from that URL; the document's issuer is adopted
+#                     and enforced on the token (set issuer too to pin it)
+# audience is always client_id; when issuer is set the token's iss must equal it.
 # issuer: ""
+# jwks_uri: ""
+# jwt_public_key: ""
+# leeway: 60  # seconds of clock skew tolerated on exp/nbf/iat
+
+# With none of the three above the plugin refuses to start. This opts in to
+# accepting unsigned ID tokens (insecure; logs an ERROR at start and at every login).
+# allow_unverified_id_token: false
