@@ -37,7 +37,9 @@ class Module(module.ModuleModel):
     def init(self):
         """ Init module """
         log.info("Initializing module")
-        # Refuse to start with unverified ID tokens unless explicitly allowed
+        # Bind the @web.method helpers first (init_all does it again, harmlessly),
+        # then refuse to start with unverified ID tokens unless explicitly allowed
+        self.descriptor.init_methods()
         self.check_id_token_config()
         # Init
         self.descriptor.init_all(

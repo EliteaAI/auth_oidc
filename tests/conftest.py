@@ -152,6 +152,9 @@ class Descriptor:
         self.name = "auth_oidc"
         self.initialized = False
 
+    def init_methods(self, module_methods=True):
+        self.methods_initialized = True
+
     def init_all(self, **kwargs):
         self.initialized = True
 

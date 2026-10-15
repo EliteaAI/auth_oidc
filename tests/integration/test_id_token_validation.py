@@ -346,3 +346,15 @@ def test_metadata_endpoint_alone_discovers_and_enforces_the_document_issuer(
 
     with pytest.raises(Exception):
         decode(subject, make_token(signing_key, iss="https://evil.example.com"))
+
+
+def test_an_unconfigured_provider_is_not_refused(build_module, log):
+    subject = build_module(client_id="", authorization_endpoint="", token_endpoint="")
+    subject.check_id_token_config()  # inert plugin: nothing to verify, nothing to refuse
+    assert any("not configured" in line for line in log.lines("info"))
+
+
+def test_init_binds_methods_before_the_id_token_check(plugin_root):
+    source = (plugin_root / "module.py").read_text()
+    assert source.index("self.descriptor.init_methods()") < source.index("self.check_id_token_config()") \
+        < source.index("self.descriptor.init_all(")

@@ -93,6 +93,12 @@ class Method:  # pylint: disable=E1101,R0903,W0201
     @web.method()
     def check_id_token_config(self):
         """ Refuse to run with an ID token nobody verifies, unless asked to explicitly """
+        config = self.descriptor.config
+        if not any((config.get(key) or "").strip() if isinstance(config.get(key), str) else config.get(key)
+                   for key in ("client_id", "authorization_endpoint", "metadata_endpoint", "issuer")):
+            log.info("OIDC provider is not configured; ID token verification check skipped")
+            return
+        #
         source = self.get_id_token_source()
         if source is not None:
             log.info("ID token verification: keys from %s", source)
