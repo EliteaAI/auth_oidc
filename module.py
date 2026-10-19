@@ -37,6 +37,10 @@ class Module(module.ModuleModel):
     def init(self):
         """ Init module """
         log.info("Initializing module")
+        # Bind the @web.method helpers first (init_all does it again, harmlessly),
+        # then refuse to start with unverified ID tokens unless explicitly allowed
+        self.descriptor.init_methods()
+        self.check_id_token_config()
         # Init
         self.descriptor.init_all(
             url_prefix=auth_core.get_relative_url_prefix(
@@ -55,6 +59,13 @@ class Module(module.ModuleModel):
     def reconfig(self):
         """ Re-config module """
         log.info("Re-configuring module")
+        # Key locations may have changed; a config that no longer verifies is
+        # reported here and refused at every login
+        self.reset_id_token_cache()
+        try:
+            self.check_id_token_config()
+        except RuntimeError as exception:
+            log.error("%s", exception)
         # Re-get metadata
         self.get_metadata()
 
