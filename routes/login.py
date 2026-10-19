@@ -242,10 +242,16 @@ class Route:  # pylint: disable=E1101,R0903
         else:
             auth_exp = datetime.datetime.fromtimestamp(id_data["exp"])
         #
-        try:
-            auth_user_id = auth_core.get_user_from_provider(auth_name)["id"]
-        except:  # pylint: disable=W0702
-            auth_user_id = None
+        # sub is stable across email/username changes, preferred_username is not
+        stable_ref = f"oidc:sub:{oidc_sub}"
+        #
+        auth_user_id = None
+        for provider_ref in (stable_ref, auth_name):
+            try:
+                auth_user_id = auth_core.get_user_from_provider(provider_ref)["id"]
+                break
+            except:  # pylint: disable=W0702
+                pass
         #
         auth_ctx = auth_core.get_auth_context()
         auth_ctx["done"] = auth_ok
@@ -253,6 +259,7 @@ class Route:  # pylint: disable=E1101,R0903
         auth_ctx["expiration"] = auth_exp
         auth_ctx["provider"] = "oidc"
         auth_ctx["provider_attr"]["nameid"] = auth_name
+        auth_ctx["provider_attr"]["stable_ref"] = stable_ref
         auth_ctx["provider_attr"]["attributes"] = auth_attributes
         auth_ctx["provider_attr"]["sessionindex"] = auth_sessionindex
         auth_ctx["user_id"] = auth_user_id
