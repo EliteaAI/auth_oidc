@@ -275,7 +275,12 @@ class Route:  # pylint: disable=E1101,R0903
         except:  # pylint: disable=W0702
             auth_user_id = None
         #
-        auth_ctx = auth_core.get_auth_context()
+        # A fresh context: a login never inherits the user or provider data of the session it
+        # replaces (the processors and access_success_redirect also refuse a foreign user id)
+        auth_ctx = {
+            "done": False, "error": "", "expiration": None,
+            "provider": None, "provider_attr": {}, "user_id": None,
+        }
         auth_ctx["done"] = auth_ok
         auth_ctx["error"] = ""
         auth_ctx["expiration"] = auth_exp

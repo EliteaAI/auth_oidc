@@ -129,6 +129,24 @@ def test_a_good_callback_succeeds_and_stores_the_session(module, flask, auth_cor
     assert saved["provider_attr"]["sessionindex"] == token_endpoint.response["id_token"]
 
 
+def test_a_login_never_inherits_the_session_it_replaces(module, flask, auth_core, token_endpoint, signing_key):
+    # Another identity is still in the session (e.g. a form login): a provider login starts from a
+    # fresh context, so the processors never see that user id or its attributes
+    auth_core.context = {"done": True, "provider": "form", "user_id": 99,
+                         "provider_attr": {"nameid": "admin", "attributes": {"email": "admin@centry.user"}}}
+    sent = start_login(module, flask)
+    token_endpoint.response = token_response(signing_key, sent)
+
+    result = callback(module, flask, sent)
+
+    assert result[0] == "SUCCESS"
+    saved = auth_core.saved
+    assert saved["user_id"] is None  # no provider mapping for this nameid in the fake
+    assert saved["provider"] == "oidc"
+    assert saved["provider_attr"]["nameid"] == "user@example.com"
+    assert saved["provider_attr"]["attributes"].get("email") != "admin@centry.user"
+
+
 def test_the_state_is_single_use(module, flask, token_endpoint, signing_key):
     sent = start_login(module, flask)
     token_endpoint.response = token_response(signing_key, sent)
