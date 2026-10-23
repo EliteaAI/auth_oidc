@@ -229,14 +229,14 @@ def test_the_id_token_response_type_has_no_custody(build_module, signing_key, fl
 # --- custody -----------------------------------------------------------------
 
 
-def test_the_custody_dict_has_exactly_the_five_keys(module, flask, auth_core, token_endpoint, signing_key):
+def test_the_custody_dict_has_exactly_the_six_keys(module, flask, auth_core, token_endpoint, signing_key):
     sent = start_login(module, flask)
     token_endpoint.response = token_response(signing_key, sent)
 
     callback(module, flask, sent)
 
     assert set(auth_core.saved["provider_attr"]["delegation"]) == {
-        "access_token", "refresh_token", "expires_at", "scope", "token_type",
+        "access_token", "refresh_token", "id_token", "expires_at", "scope", "token_type",
     }
 
 
@@ -256,6 +256,7 @@ def test_the_token_response_is_kept_server_side_under_delegation(
     assert attr["delegation"] == {
         "access_token": ACCESS_TOKEN,
         "refresh_token": REFRESH_TOKEN,
+        "id_token": token_endpoint.response["id_token"],
         "scope": "openid profile email offline_access",
         "token_type": "Bearer",
     }
@@ -327,6 +328,73 @@ def test_non_string_identity_claims_are_dropped(module):
 
     assert identity["tid"] is None
     assert identity["oid"] is None
+
+
+# --- subject claims of a generic issuer (Keycloak) ---------------------------
+
+
+REALM_TENANT = "11111111-2222-4333-8444-555555555555"
+KEYCLOAK = {"subject_claims": {"tid": None, "oid": "sub"}, "subject_tenant": REALM_TENANT.upper()}
+
+
+def test_the_default_subject_mapping_is_the_entra_contract(module):
+    assert module.get_subject_mapping() == ("tid", "oid", None)
+
+
+def test_a_keycloak_mapping_takes_the_subject_from_sub_and_the_tenant_from_the_config(
+        build_module, signing_key, flask, auth_core, token_endpoint):
+    module = build_module(jwt_public_key=signing_key.public_pem, issuer=ISSUER, **KEYCLOAK)
+    sent = start_login(module, flask)
+    # the token carries no tid/oid at all, as Keycloak's does
+    token_endpoint.response = token_response(signing_key, sent, tid=None, oid=None)
+
+    callback(module, flask, sent)
+
+    assert auth_core.saved["provider_attr"]["identity"] == {
+        "issuer": ISSUER, "tid": REALM_TENANT, "oid": "sub-1", "sub": "sub-1",
+    }
+
+
+def test_a_keycloak_mapping_ignores_entra_claims_the_token_happens_to_carry(build_module, signing_key):
+    module = build_module(jwt_public_key=signing_key.public_pem, **KEYCLOAK)
+
+    identity = module.build_identity({"iss": "i", "sub": "s", "tid": "other-tenant", "oid": "other-object"})
+
+    assert identity == {"issuer": "i", "tid": REALM_TENANT, "oid": "s", "sub": "s"}
+
+
+def test_a_renamed_tenant_claim_is_read_from_the_token(build_module, signing_key):
+    module = build_module(jwt_public_key=signing_key.public_pem, subject_claims={"tid": "realm"})
+
+    assert module.build_identity({"iss": "i", "sub": "s", "realm": "r", "oid": "o"}) == {
+        "issuer": "i", "tid": "r", "oid": "o", "sub": "s",
+    }
+
+
+@pytest.mark.parametrize("config", [
+    {"subject_claims": {"oid": ""}},
+    {"subject_claims": {"oid": None}},
+    {"subject_claims": {"tid": ""}},
+    {"subject_claims": {"tid": None}},
+    {"subject_claims": {"tid": None}, "subject_tenant": "not-a-guid"},
+    {"subject_claims": {"subject": "sub"}},
+    {"subject_claims": "sub"},
+    {"subject_tenant": REALM_TENANT},
+], ids=lambda c: str(c))
+def test_init_refuses_a_subject_mapping_that_cannot_form_an_identity(build_module, auth_core, signing_key, config):
+    module = build_module(jwt_public_key=signing_key.public_pem, **config)
+
+    with pytest.raises(RuntimeError, match="subject mapping"):
+        module.init()
+
+    assert auth_core.registered == []
+
+
+def test_init_starts_with_a_keycloak_mapping(build_module, auth_core, signing_key, log):
+    build_module(jwt_public_key=signing_key.public_pem, **KEYCLOAK).init()
+
+    assert auth_core.registered == ["oidc"]
+    assert any("Identity subject" in line for line in log.lines("info"))
 
 
 # --- redaction ---------------------------------------------------------------

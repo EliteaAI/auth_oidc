@@ -18,6 +18,7 @@
 """ Method """
 
 import hmac
+import re
 import time
 
 import requests  # pylint: disable=E0401
@@ -33,6 +34,9 @@ DISCOVERY_PATH = "/.well-known/openid-configuration"
 # iss is required by PyJWT whenever an issuer is configured; without one the token
 # is still accepted as before.
 REQUIRED_CLAIMS = ["exp", "iat", "sub", "aud"]
+# Which ID token claims carry the tenant and the subject of the immutable identity
+DEFAULT_SUBJECT_CLAIMS = {"tid": "tid", "oid": "oid"}
+_GUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def nonce_matches(expected, actual):
@@ -53,6 +57,10 @@ def _text_claim(data, name):
     """ A claim that is a non-empty string, else None """
     value = data.get(name)
     return value if isinstance(value, str) and value else None
+
+
+def _is_claim_name(value):
+    return isinstance(value, str) and value != "" and value == value.strip()
 
 
 class Method:  # pylint: disable=E1101,R0903,W0201
@@ -200,12 +208,55 @@ class Method:  # pylint: disable=E1101,R0903,W0201
         return id_data
 
     @web.method()
+    def get_subject_mapping(self):
+        """ (tenant claim or None, subject claim, fixed tenant or None) from the config
+
+        subject_claims names the claims (default tid/oid, Entra). tid null means the
+        issuer has no tenant claim (Keycloak): the identity's tenant is then
+        subject_tenant, a GUID the operator assigns to that realm. Raises ValueError
+        on a config that cannot produce a complete identity.
+        """
+        config = self.descriptor.config
+        mapping = config.get("subject_claims")
+        if mapping is None:
+            mapping = {}
+        if not isinstance(mapping, dict) or set(mapping) - set(DEFAULT_SUBJECT_CLAIMS):
+            raise ValueError("subject_claims must be a mapping with only tid and oid")
+        tid_claim = mapping.get("tid", DEFAULT_SUBJECT_CLAIMS["tid"])
+        oid_claim = mapping.get("oid", DEFAULT_SUBJECT_CLAIMS["oid"])
+        if not _is_claim_name(oid_claim):
+            raise ValueError("subject_claims.oid must be a claim name")
+        if tid_claim is not None and not _is_claim_name(tid_claim):
+            raise ValueError("subject_claims.tid must be a claim name or null")
+        #
+        tenant = config.get("subject_tenant")
+        if tid_claim is None:
+            if not isinstance(tenant, str) or not _GUID.fullmatch(tenant):
+                raise ValueError("subject_tenant must be a GUID when subject_claims.tid is null")
+            return None, oid_claim, tenant.lower()
+        if tenant not in (None, ""):
+            raise ValueError("subject_tenant is only used when subject_claims.tid is null")
+        return tid_claim, oid_claim, None
+
+    @web.method()
+    def check_subject_config(self):
+        """ Refuse to run with a subject mapping that cannot produce an identity """
+        try:
+            tid_claim, oid_claim, tenant = self.get_subject_mapping()
+        except ValueError as exception:
+            raise RuntimeError(f"OIDC subject mapping is not valid: {exception}") from exception
+        if (tid_claim, oid_claim, tenant) != ("tid", "oid", None):
+            log.info("Identity subject: tenant from %s, subject from claim %s",
+                     "configuration" if tid_claim is None else f"claim {tid_claim}", oid_claim)
+
+    @web.method()
     def build_identity(self, id_data):
         """ The immutable identity an ID token vouches for (None for what is absent) """
+        tid_claim, oid_claim, tenant = self.get_subject_mapping()
         return {
             "issuer": _text_claim(id_data, "iss"),
-            "tid": _text_claim(id_data, "tid"),
-            "oid": _text_claim(id_data, "oid"),
+            "tid": _text_claim(id_data, tid_claim) if tid_claim else tenant,
+            "oid": _text_claim(id_data, oid_claim),
             "sub": _text_claim(id_data, "sub"),
         }
 
@@ -214,8 +265,8 @@ class Method:  # pylint: disable=E1101,R0903,W0201
         """ What the token response is kept as, server-side, for the middle tier
 
         Lives in the session (Redis-backed in pylon_auth), never in the cookie and
-        never among the attributes handed to processors and logs. Nothing reads it
-        yet.
+        never among the attributes handed to processors and logs. The identity
+        verifier reads the access token (or, configured so, the ID token).
         """
         if now is None:
             now = time.time()
@@ -228,6 +279,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
         return {
             "access_token": oidc_token.get("access_token"),
             "refresh_token": oidc_token.get("refresh_token"),
+            "id_token": oidc_token.get("id_token"),
             "expires_at": expires_at,
             "scope": oidc_token.get("scope"),
             "token_type": oidc_token.get("token_type"),

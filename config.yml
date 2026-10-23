@@ -24,6 +24,14 @@ client_secret: ""
 # jwt_public_key: ""
 # leeway: 60  # seconds of clock skew tolerated on exp/nbf/iat
 
+# Which ID token claims carry the tenant and the subject of the user's immutable
+# identity (issuer, tid, oid). Defaults are the Entra claims. A generic issuer such as
+# Keycloak has no tenant claim: set tid to null, take the subject from "sub", and give
+# the realm a fixed tenant GUID (the same value as pylon_main's identity_verifier
+# tenant_id). The plugin refuses to start with a mapping that cannot form an identity.
+# subject_claims: {tid: tid, oid: oid}
+# subject_tenant: ""
+
 # With none of the three above the plugin refuses to start. This opts in to
 # accepting unsigned ID tokens (insecure; logs an ERROR at start and at every login).
 # allow_unverified_id_token: false
