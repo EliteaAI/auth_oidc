@@ -41,6 +41,7 @@ class Module(module.ModuleModel):
         # then refuse to start with unverified ID tokens unless explicitly allowed
         self.descriptor.init_methods()
         self.check_id_token_config()
+        self.check_subject_config()
         # Init
         self.descriptor.init_all(
             url_prefix=auth_core.get_relative_url_prefix(
@@ -64,6 +65,7 @@ class Module(module.ModuleModel):
         self.reset_id_token_cache()
         try:
             self.check_id_token_config()
+            self.check_subject_config()
         except RuntimeError as exception:
             log.error("%s", exception)
         # Re-get metadata
