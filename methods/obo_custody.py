@@ -130,10 +130,18 @@ class Method:  # pylint: disable=E1101,R0903
 
     @web.method()
     def obo_custody_ttl(self):
-        """ How long custody lives: as long as a session does (the person is signed in), the run cap otherwise """
-        lifetime = getattr(getattr(self.context, "app", None), "permanent_session_lifetime", None)
-        seconds = lifetime.total_seconds() if hasattr(lifetime, "total_seconds") else None
-        return max(60, int(seconds)) if seconds else CUSTODY_TTL_S
+        """ How long custody lives: as long as a session does (the person is signed in), the run cap otherwise. Read
+        from the app config pylon sets from ``COOKIES_LIFETIME`` (seconds or a timedelta); pylon's app shim proxies
+        ``config`` and raises for attributes it does not know, so nothing else is asked of it. """
+        try:
+            lifetime = self.context.app.config.get("PERMANENT_SESSION_LIFETIME")
+        except Exception:  # pylint: disable=W0703
+            lifetime = None
+        try:
+            seconds = lifetime.total_seconds() if hasattr(lifetime, "total_seconds") else float(lifetime)
+        except (TypeError, ValueError):
+            seconds = None
+        return max(60, int(seconds)) if seconds and seconds > 0 else CUSTODY_TTL_S
 
     @web.method()
     def obo_custody_key(self, tid, oid):

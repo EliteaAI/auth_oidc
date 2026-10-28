@@ -99,6 +99,21 @@ class Session:
         return types.SimpleNamespace(json=lambda: body, status_code=status)
 
 
+class AppShim:
+    """pylon's app shim, as auth_oidc meets it at runtime: a few proxied attributes, a RuntimeError for any other."""
+
+    def __init__(self, **proxied):
+        self.__dict__["_proxied"] = proxied
+
+    def __getattr__(self, name):
+        if name in self._proxied:
+            return self._proxied[name]
+        raise RuntimeError("Not supported")
+
+    def __setattr__(self, name, value):
+        self._proxied[name] = value
+
+
 @pytest.fixture
 def redis():
     return Redis()
@@ -126,8 +141,9 @@ def make(build_module, signing_key, redis):
         config.setdefault("token_endpoint", f"https://login.microsoftonline.com/{TID}/oauth2/v2.0/token")
         config.setdefault("scope", "openid profile offline_access api://api-client/access_as_user")
         module = build_module(jwt_public_key=signing_key.public_pem, issuer=config.pop("issuer", ENTRA), **config)
-        module.context.app.session_interface = types.SimpleNamespace(client=redis)
-        module.context.app.permanent_session_lifetime = datetime.timedelta(days=7)
+        module.context.app = AppShim(secret_key=module.context.app.secret_key,
+                                     session_interface=types.SimpleNamespace(client=redis),
+                                     config={"PERMANENT_SESSION_LIFETIME": "604800"})   # as pylon.yml sets it
         module.context.settings = {"sessions": {"prefix": "p_auth_session_"}}
         module.events = []
         module.context.event_manager = types.SimpleNamespace(
@@ -307,3 +323,18 @@ def test_the_refresh_never_turns_off_tls_verification(make, flask, endpoint, sig
     sign_in(module, flask, endpoint, signing_key)
     assert ask(module, TID, OID, refresh=True)["ok"] is True
     assert endpoint.posts[-1][1]["verify"] is True
+
+
+@pytest.mark.parametrize("lifetime, expected", [
+    (datetime.timedelta(hours=2), 7200), (3600, 3600), ("abc", 86400), (None, 86400), (0, 86400)])
+def test_the_custody_lifetime_comes_from_the_session_lifetime_config(make, lifetime, expected):
+    module = make()
+    module.context.app.config["PERMANENT_SESSION_LIFETIME"] = lifetime
+    assert module.obo_custody_ttl() == expected
+
+
+def test_custody_is_kept_behind_pylons_app_shim(make, flask, endpoint, signing_key, redis, log):
+    """Regression (Phase 2, 2026-10-28): the lifetime was read from an attribute the shim does not proxy."""
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    assert KEY in redis.values and "OBO custody was not kept" not in log.everything()
