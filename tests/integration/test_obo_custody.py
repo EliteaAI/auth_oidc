@@ -1,0 +1,272 @@
+"""Custody of a Microsoft sign-in for on-behalf-of exchanges, and the assertion RPC (C-1009 #6756 step 4).
+
+Through the plugin's real login callback, logout and RPC; Redis and the token endpoint are fakes. Every token here is
+made up for the tests and never signed by anyone real.
+"""
+import base64
+import hashlib
+import hmac
+import json
+import secrets
+import time
+import types
+import urllib.parse
+
+import pytest
+
+from conftest import CLIENT_ID, make_token
+
+TID = "11111111-2222-3333-4444-555555555555"
+OID = "oid-42"
+ENTRA = f"https://login.microsoftonline.com/{TID}/v2.0"
+REFRESH_TOKEN = "refresh-token-made-up-dddd"
+NEW_REFRESH_TOKEN = "refresh-token-made-up-eeee"
+REQUEST_KEY = "custody-request-key-made-up-for-tests-0123"
+
+
+def signed(tid, oid, refresh=False, key=REQUEST_KEY, iat=None, nonce=None):
+    """What elitea_core sends: the request, its time, a fresh nonce and the signature over them."""
+    iat = int(time.time()) if iat is None else iat
+    nonce = nonce or secrets.token_urlsafe(16)
+    message = "|".join(("v1", str(tid), str(oid), "1" if refresh else "0", str(iat), nonce)).encode()
+    return {"tid": tid, "oid": oid, "refresh": refresh, "iat": iat, "nonce": nonce,
+            "signature": hmac.new(key.encode(), message, hashlib.sha256).hexdigest()}
+
+
+def ask(module, tid, oid, refresh=False, **over):
+    return module.obo_assertion(**{**signed(tid, oid, refresh), **over})
+
+
+def jwt(**claims):
+    def part(value):
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+    return f"{part({'alg': 'none'})}.{part(claims)}.sig"
+
+
+ACCESS = jwt(iss=ENTRA, tid=TID, oid=OID, aud="api-client", scp="access_as_user")
+NEW_ACCESS = jwt(iss=ENTRA, tid=TID, oid=OID, aud="api-client", scp="access_as_user", n=2)
+
+
+class Redis:
+    def __init__(self):
+        self.values, self.ttls, self.calls = {}, {}, []
+
+    def set(self, key, value, ex=None, keepttl=False, nx=False):
+        if nx and key in self.values:
+            return None
+        if ":nonce:" not in key:
+            self.calls.append(("set", key, ex, keepttl))
+        self.values[key] = value
+        if not keepttl:
+            self.ttls[key] = ex
+        return True
+
+    def get(self, key):
+        return self.values.get(key)
+
+    def delete(self, key):
+        self.calls.append(("delete", key))
+        self.values.pop(key, None)
+
+
+class TokenEndpoint:
+    def __init__(self):
+        self.posts, self.response = [], {}
+
+    def post(self, url, **kwargs):
+        self.posts.append((url, kwargs))
+        response = self.response
+        return types.SimpleNamespace(json=lambda: response, status_code=200)
+
+
+class Session:
+    """requests.Session as the refresh uses it."""
+
+    def __init__(self, endpoint):
+        self.endpoint, self.trust_env, self.max_redirects, self.proxies = endpoint, True, 30, None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def post(self, url, **kwargs):
+        self.endpoint.posts.append((url, {**kwargs, "_trust_env": self.trust_env,
+                                          "_max_redirects": self.max_redirects, "_proxies": self.proxies}))
+        status, body = self.endpoint.refresh
+        return types.SimpleNamespace(json=lambda: body, status_code=status)
+
+
+@pytest.fixture
+def redis():
+    return Redis()
+
+
+@pytest.fixture
+def endpoint(monkeypatch, login_mod, custody_mod):
+    found = TokenEndpoint()
+    found.refresh = (200, {"access_token": NEW_ACCESS, "refresh_token": NEW_REFRESH_TOKEN, "expires_in": 3600})
+    monkeypatch.setattr(login_mod, "requests", types.SimpleNamespace(post=found.post))
+    monkeypatch.setattr(custody_mod, "requests", types.SimpleNamespace(Session=lambda: Session(found)))
+    return found
+
+
+@pytest.fixture(autouse=True)
+def request_key(monkeypatch):
+    monkeypatch.setenv("ELITEA_OBO_CUSTODY_KEY", REQUEST_KEY)
+
+
+@pytest.fixture
+def make(build_module, signing_key, redis):
+    def build(**config):
+        config.setdefault("obo_custody_enabled", True)
+        config.setdefault("token_endpoint", f"https://login.microsoftonline.com/{TID}/oauth2/v2.0/token")
+        config.setdefault("scope", "openid profile offline_access api://api-client/access_as_user")
+        module = build_module(jwt_public_key=signing_key.public_pem, issuer=config.pop("issuer", ENTRA), **config)
+        module.context.app.session_interface = types.SimpleNamespace(client=redis)
+        module.context.settings = {"sessions": {"prefix": "p_auth_session_"}}
+        return module
+    return build
+
+
+def sign_in(module, flask, endpoint, signing_key, *, access=ACCESS, issuer=ENTRA, oid=OID):
+    flask.request.args = {"target_to": "/"}
+    _, url = module.login()
+    sent = {key: values[0] for key, values in urllib.parse.parse_qs(urllib.parse.urlparse(url).query).items()}
+    endpoint.response = {
+        "id_token": make_token(signing_key, nonce=sent["nonce"], iss=issuer, tid=TID, oid=oid, aud=CLIENT_ID),
+        "access_token": access, "refresh_token": REFRESH_TOKEN, "expires_in": 3599, "token_type": "Bearer"}
+    flask.request.method = "GET"
+    flask.request.args = {"state": sent["state"], "code": "code-made-up"}
+    return module.login_callback()
+
+
+KEY = f"c1009_obo_custody:{TID}:{OID}"
+
+
+def test_a_microsoft_sign_in_is_kept_under_the_persons_subject(make, flask, endpoint, signing_key, redis, log, auth_core):
+    module = make(obo_custody_ttl_s=7200)
+    assert sign_in(module, flask, endpoint, signing_key)[0] == "SUCCESS"
+    record = json.loads(redis.values[KEY])
+    assert {key: record[key] for key in ("issuer", "tid", "oid", "assertion_source", "access_token", "refresh_token")} == {
+        "issuer": ENTRA, "tid": TID, "oid": OID, "assertion_source": "login", "access_token": ACCESS,
+        "refresh_token": REFRESH_TOKEN}
+    assert redis.ttls[KEY] == 7200
+    assert auth_core.saved["provider_attr"]["delegation"]["access_token"] == ACCESS   # the session keeps it as before
+    assert ACCESS not in log.everything() and REFRESH_TOKEN not in log.everything()
+
+
+def test_custody_is_off_unless_switched_on(make, flask, endpoint, signing_key, redis):
+    sign_in(make(obo_custody_enabled=False), flask, endpoint, signing_key)
+    assert redis.values == {}
+
+
+@pytest.mark.parametrize("access, issuer, oid", [
+    (ACCESS, "https://keycloak.example/realms/elitea", OID),                      # a Keycloak (brokered) login
+    (jwt(iss=ENTRA, tid=TID, oid="someone-else"), ENTRA, OID),                     # an access token of someone else
+    (jwt(iss="https://evil.example/v2.0", tid=TID, oid=OID), ENTRA, OID),          # not issued by Entra
+    ("opaque-access-token", ENTRA, OID),
+])
+def test_only_microsofts_own_token_of_the_proven_identity_is_kept(make, flask, endpoint, signing_key, redis,
+                                                                    access, issuer, oid):
+    sign_in(make(issuer=issuer), flask, endpoint, signing_key, access=access, issuer=issuer, oid=oid)
+    assert redis.values == {}
+
+
+@pytest.mark.parametrize("change", [
+    {"signature": "0" * 64},                                   # not elitea_core's
+    {"iat": int(time.time()) - 120},                           # too old (the signature is over the old time)
+    {"nonce": "x"},                                            # not a nonce
+    {"refresh": True},                                         # signed for another request
+])
+def test_a_request_that_elitea_core_did_not_sign_is_refused(make, flask, endpoint, signing_key, change):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    request = signed(TID, OID, iat=change.get("iat"), nonce=change.get("nonce"))
+    request.update({key: value for key, value in change.items() if key in ("signature", "refresh")})
+    assert module.obo_assertion(**request) == {"ok": False, "code": "REQUEST_REFUSED"}
+    assert endpoint.posts[1:] == []
+
+
+def test_a_signed_request_is_answered_once(make, flask, endpoint, signing_key):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    request = signed(TID, OID)
+    assert module.obo_assertion(**request)["ok"] is True
+    assert module.obo_assertion(**request) == {"ok": False, "code": "REQUEST_REFUSED"}   # a replay
+
+
+def test_without_the_request_key_every_request_is_refused(make, flask, endpoint, signing_key, monkeypatch):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    monkeypatch.delenv("ELITEA_OBO_CUSTODY_KEY")
+    assert ask(module, TID, OID) == {"ok": False, "code": "REQUEST_REFUSED"}
+
+
+def test_the_assertion_is_handed_out_for_the_person_and_nobody_else(make, flask, endpoint, signing_key, redis):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    assert ask(module, TID, OID)["assertion"] == ACCESS
+    assert ask(module, TID, "someone-else") == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
+    assert ask(module, "../x", OID)["ok"] is False and ask(module, None, None)["ok"] is False
+    assert endpoint.posts[1:] == []   # nothing but the login's own code exchange
+
+
+def test_a_refresh_renews_once_through_a_hardened_request_and_keeps_the_custody_lifetime(
+        make, flask, endpoint, signing_key, redis, log):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    answer = ask(module, TID, OID, refresh=True)
+    assert answer["ok"] is True and answer["assertion"] == NEW_ACCESS
+    url, kwargs = endpoint.posts[-1]
+    assert url == f"https://login.microsoftonline.com/{TID}/oauth2/v2.0/token"
+    assert kwargs["data"]["grant_type"] == "refresh_token" and kwargs["data"]["refresh_token"] == REFRESH_TOKEN
+    assert (kwargs["allow_redirects"], kwargs["timeout"], kwargs["_trust_env"], kwargs["_max_redirects"],
+            kwargs["_proxies"]) == (False, 4, False, 0, {})
+    assert json.loads(redis.values[KEY])["refresh_token"] == NEW_REFRESH_TOKEN
+    assert redis.calls[-1] == ("set", KEY, None, True)
+    assert "refreshed" in "\n".join(log.lines())
+    for secret in (ACCESS, NEW_ACCESS, REFRESH_TOKEN, NEW_REFRESH_TOKEN):
+        assert secret not in log.everything()
+
+
+def test_an_access_token_about_to_expire_is_refreshed_without_being_asked(make, flask, endpoint, signing_key, redis):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    record = json.loads(redis.values[KEY])
+    record["expires_at"] = int(time.time()) + 30
+    redis.values[KEY] = json.dumps(record)
+    assert ask(module, TID, OID)["assertion"] == NEW_ACCESS
+
+
+@pytest.mark.parametrize("refresh", [(400, {"error": "invalid_grant"}),
+                                     (200, {"access_token": jwt(iss=ENTRA, tid=TID, oid="someone-else"),
+                                            "expires_in": 3600})])
+def test_a_refused_or_foreign_refresh_answers_unavailable_and_keeps_the_record(make, flask, endpoint, signing_key,
+                                                                                 redis, refresh):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    before = redis.values[KEY]
+    endpoint.refresh = refresh
+    assert ask(module, TID, OID, refresh=True) == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
+    assert redis.values[KEY] == before
+
+
+def test_a_refresh_is_never_sent_over_plain_http(make, flask, endpoint, signing_key, redis):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    module.descriptor.config["token_endpoint"] = f"http://login.microsoftonline.com/{TID}/oauth2/v2.0/token"
+    posts = len(endpoint.posts)
+    assert ask(module, TID, OID, refresh=True)["ok"] is False and len(endpoint.posts) == posts
+
+
+def test_signing_out_drops_the_custody(make, flask, endpoint, signing_key, redis, auth_core):
+    module = make(logout_mode="local", end_session_endpoint="https://login.microsoftonline.com/logout")
+    sign_in(module, flask, endpoint, signing_key)
+    auth_core.context = auth_core.saved
+    auth_core.logout_success_redirect = lambda target: ("LOGGED_OUT", target)
+    flask.request.args = {}
+    assert module.logout()[0] == "LOGGED_OUT"
+    assert KEY not in redis.values
+    assert ask(module, TID, OID)["ok"] is False

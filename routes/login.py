@@ -299,6 +299,8 @@ class Route:  # pylint: disable=E1101,R0903
         if delegation is not None:
             # Server-side only (Redis-backed session); never in "attributes"
             auth_ctx["provider_attr"]["delegation"] = delegation
+            # and, for a Microsoft sign-in with obo_custody_enabled, under the person's subject (#6756 step 4)
+            self.keep_obo_custody(identity, delegation)
         auth_ctx["user_id"] = auth_user_id
         auth_core.set_auth_context(auth_ctx)
         #

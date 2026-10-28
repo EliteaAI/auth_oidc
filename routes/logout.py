@@ -49,6 +49,8 @@ class Route:  # pylint: disable=E1101,R0903
         """ Logout """
         target_token = flask.request.args.get("target_to", "")
         auth_ctx = auth_core.get_auth_context()
+        # a person who signs out no longer lends their Microsoft sign-in to runs (#6756 step 4)
+        self.drop_obo_custody(auth_ctx.get("provider_attr", {}).get("identity"))
         #
         if "auth_oidc" not in flask.session:
             flask.session["auth_oidc"] = {}
