@@ -4,6 +4,7 @@ Through the plugin's real login callback, logout and RPC; Redis and the token en
 made up for the tests and never signed by anyone real.
 """
 import base64
+import datetime
 import hashlib
 import hmac
 import json
@@ -121,11 +122,16 @@ def request_key(monkeypatch):
 def make(build_module, signing_key, redis):
     def build(**config):
         config.setdefault("obo_custody_enabled", True)
+        config.setdefault("obo_api_client_id", "api-client")
         config.setdefault("token_endpoint", f"https://login.microsoftonline.com/{TID}/oauth2/v2.0/token")
         config.setdefault("scope", "openid profile offline_access api://api-client/access_as_user")
         module = build_module(jwt_public_key=signing_key.public_pem, issuer=config.pop("issuer", ENTRA), **config)
         module.context.app.session_interface = types.SimpleNamespace(client=redis)
+        module.context.app.permanent_session_lifetime = datetime.timedelta(days=7)
         module.context.settings = {"sessions": {"prefix": "p_auth_session_"}}
+        module.events = []
+        module.context.event_manager = types.SimpleNamespace(
+            fire_event=lambda name, payload: module.events.append((name, payload)))
         return module
     return build
 
@@ -146,13 +152,13 @@ KEY = f"c1009_obo_custody:{TID}:{OID}"
 
 
 def test_a_microsoft_sign_in_is_kept_under_the_persons_subject(make, flask, endpoint, signing_key, redis, log, auth_core):
-    module = make(obo_custody_ttl_s=7200)
+    module = make()
     assert sign_in(module, flask, endpoint, signing_key)[0] == "SUCCESS"
     record = json.loads(redis.values[KEY])
     assert {key: record[key] for key in ("issuer", "tid", "oid", "assertion_source", "access_token", "refresh_token")} == {
         "issuer": ENTRA, "tid": TID, "oid": OID, "assertion_source": "login", "access_token": ACCESS,
         "refresh_token": REFRESH_TOKEN}
-    assert redis.ttls[KEY] == 7200
+    assert redis.ttls[KEY] == 7 * 86400   # as long as the session lives
     assert auth_core.saved["provider_attr"]["delegation"]["access_token"] == ACCESS   # the session keeps it as before
     assert ACCESS not in log.everything() and REFRESH_TOKEN not in log.everything()
 
@@ -164,8 +170,9 @@ def test_custody_is_off_unless_switched_on(make, flask, endpoint, signing_key, r
 
 @pytest.mark.parametrize("access, issuer, oid", [
     (ACCESS, "https://keycloak.example/realms/elitea", OID),                      # a Keycloak (brokered) login
-    (jwt(iss=ENTRA, tid=TID, oid="someone-else"), ENTRA, OID),                     # an access token of someone else
-    (jwt(iss="https://evil.example/v2.0", tid=TID, oid=OID), ENTRA, OID),          # not issued by Entra
+    (jwt(iss=ENTRA, tid=TID, oid="someone-else", aud="api-client"), ENTRA, OID),   # an access token of someone else
+    (jwt(iss="https://evil.example/v2.0", tid=TID, oid=OID, aud="api-client"), ENTRA, OID),   # not issued by Entra
+    (jwt(iss=ENTRA, tid=TID, oid=OID, aud="https://graph.microsoft.com"), ENTRA, OID),     # a token for another API
     ("opaque-access-token", ENTRA, OID),
 ])
 def test_only_microsofts_own_token_of_the_proven_identity_is_kept(make, flask, endpoint, signing_key, redis,
@@ -201,7 +208,7 @@ def test_without_the_request_key_every_request_is_refused(make, flask, endpoint,
     module = make()
     sign_in(module, flask, endpoint, signing_key)
     monkeypatch.delenv("ELITEA_OBO_CUSTODY_KEY")
-    assert ask(module, TID, OID) == {"ok": False, "code": "REQUEST_REFUSED"}
+    assert ask(module, TID, OID) == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}   # custody is off without its key
 
 
 def test_the_assertion_is_handed_out_for_the_person_and_nobody_else(make, flask, endpoint, signing_key, redis):
@@ -241,7 +248,7 @@ def test_an_access_token_about_to_expire_is_refreshed_without_being_asked(make, 
 
 
 @pytest.mark.parametrize("refresh", [(400, {"error": "invalid_grant"}),
-                                     (200, {"access_token": jwt(iss=ENTRA, tid=TID, oid="someone-else"),
+                                     (200, {"access_token": jwt(iss=ENTRA, tid=TID, oid="someone-else", aud="api-client"),
                                             "expires_in": 3600})])
 def test_a_refused_or_foreign_refresh_answers_unavailable_and_keeps_the_record(make, flask, endpoint, signing_key,
                                                                                  redis, refresh):
@@ -256,9 +263,11 @@ def test_a_refused_or_foreign_refresh_answers_unavailable_and_keeps_the_record(m
 def test_a_refresh_is_never_sent_over_plain_http(make, flask, endpoint, signing_key, redis):
     module = make()
     sign_in(module, flask, endpoint, signing_key)
-    module.descriptor.config["token_endpoint"] = f"http://login.microsoftonline.com/{TID}/oauth2/v2.0/token"
     posts = len(endpoint.posts)
-    assert ask(module, TID, OID, refresh=True)["ok"] is False and len(endpoint.posts) == posts
+    for url in (f"http://login.microsoftonline.com/{TID}/oauth2/v2.0/token", "https://keycloak.example/token",
+                f"https://login.microsoftonline.com:8443/{TID}/oauth2/v2.0/token"):
+        module.descriptor.config["token_endpoint"] = url
+        assert ask(module, TID, OID, refresh=True)["ok"] is False and len(endpoint.posts) == posts
 
 
 def test_signing_out_drops_the_custody(make, flask, endpoint, signing_key, redis, auth_core):
@@ -270,3 +279,31 @@ def test_signing_out_drops_the_custody(make, flask, endpoint, signing_key, redis
     assert module.logout()[0] == "LOGGED_OUT"
     assert KEY not in redis.values
     assert ask(module, TID, OID)["ok"] is False
+    assert module.events == [("auth_oidc_obo_custody_dropped", {"tid": TID, "oid": OID})]   # Main drops its tokens
+
+
+
+@pytest.mark.parametrize("unset", ["key", "api_client_id"])
+def test_custody_switched_on_without_its_key_or_audience_keeps_nothing_and_says_so(
+        make, flask, endpoint, signing_key, redis, log, monkeypatch, unset):
+    if unset == "key":
+        monkeypatch.setenv("ELITEA_OBO_CUSTODY_KEY", "too-short")
+        module = make()
+    else:
+        module = make(obo_api_client_id=None)
+    log.clear()
+    assert module.check_obo_custody_config() is False
+    assert any(level == "error" and "OBO custody is enabled" in text for level, text, _ in log.records)
+    sign_in(module, flask, endpoint, signing_key)
+    assert redis.values == {}
+
+
+def test_a_complete_custody_configuration_passes_the_init_check(make):
+    assert make().check_obo_custody_config() is True and make(obo_custody_enabled=False).check_obo_custody_config()
+
+
+def test_the_refresh_never_turns_off_tls_verification(make, flask, endpoint, signing_key):
+    module = make(token_endpoint_verify=False)
+    sign_in(module, flask, endpoint, signing_key)
+    assert ask(module, TID, OID, refresh=True)["ok"] is True
+    assert endpoint.posts[-1][1]["verify"] is True

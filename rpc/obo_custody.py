@@ -48,7 +48,8 @@ class RPC:  # pylint: disable=R0903,E1101
             raw = store.get(key)
             record = json.loads(raw) if raw else None
             if not isinstance(record, dict) or (record.get("tid"), record.get("oid")) != (tid, oid) or \
-                    not entra_token_of(record.get("access_token"), tid, oid):
+                    not entra_token_of(record.get("access_token"), tid, oid,
+                                       self.descriptor.config.get("obo_api_client_id")):
                 return dict(UNAVAILABLE)
             expires_at = record.get("expires_at")
             if refresh or not isinstance(expires_at, int) or expires_at - time.time() < REFRESH_BEFORE_S:

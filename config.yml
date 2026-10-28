@@ -41,8 +41,10 @@ client_secret: ""
 # (elitea_core asks for it over RPC auth_oidc_obo_assertion). The scope above must then ask for the platform API's
 # access_as_user scope and offline_access. Logout drops it.
 # Each request is signed with a key shared with elitea_core only (32+ characters, from the environment variable named
-# here); without it every request is refused.
+# here; give it to pylon_auth and pylon_main only, never through an env file every pylon loads). obo_api_client_id is
+# the platform API's client id: only a sign-in token for it is kept. Missing key or id: nothing is kept (ERROR at init).
+# Custody lives as long as the session does.
 # obo_custody_enabled: false
-# obo_custody_ttl_s: 86400
+# obo_api_client_id: <platform API client id>
 # obo_custody_key_env: ELITEA_OBO_CUSTODY_KEY
 # obo_custody_prefix: c1009_obo_custody:
