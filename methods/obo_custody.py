@@ -25,7 +25,14 @@ session itself lives) — only for a Microsoft (Entra v2) sign-in whose access t
 the Graph tokens it minted for the person. ``auth_oidc_obo_assertion`` (rpc/obo_custody.py) hands out the access token, refreshing
 it once with the stored refresh token when asked or when it is about to expire.
 
-Nothing here logs a token or a token response; only fixed reasons and exception types.
+Step 4b (``obo_assertion_source: keycloak_broker``): the login is Keycloak's, which brokered it to Entra and stored
+Entra's token response. Right after the login, one call to the realm's broker token endpoint
+(``<issuer>/broker/<obo_broker_alias>/token``, with the session's Keycloak access token) fetches it; the same record is
+kept with ``assertion_source: "broker"`` only for an Entra v2 access token for the platform API of exactly the identity
+Keycloak vouched for. Its refresh goes to the Entra authority with the Entra client Keycloak brokers through
+(``obo_broker_refresh_*``), never to Keycloak.
+
+Nothing here logs a token or a token response; only fixed reasons, status codes and exception types.
 """
 
 import base64
@@ -48,6 +55,17 @@ DROPPED_EVENT = "auth_oidc_obo_custody_dropped"   # elitea_core drops the person
 DEFAULT_PREFIX = "c1009_obo_custody:"
 REFRESH_BEFORE_S = 120             # refresh an access token with less life than this left
 HTTP_TIMEOUT_S = 4                 # inside elitea_core's 5 s RPC wait
+CONNECT_TIMEOUT_S = 3
+BROKER_TOTAL_S = 8                 # the broker call at login, all of it (connect, wait, body)
+MAX_BROKER_BYTES = 65_536          # a token response is a few KiB
+SOURCES = ("login", "keycloak_broker")
+_ALIAS = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_GUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+BROKER_REFUSALS = {   # what Keycloak's broker token endpoint means by its answer (status codes only are logged)
+    400: "the login is not brokered, Store tokens is off, or the session token was refused",
+    403: "the person lacks the broker read-token role",
+    404: "no token is stored for the person's brokered login",
+}
 DEFAULT_REQUEST_KEY_ENV = "ELITEA_OBO_CUSTODY_KEY"   # shared with elitea_core only
 MIN_REQUEST_KEY_CHARS = 32
 REQUEST_MAX_AGE_S = 30
@@ -78,6 +96,35 @@ def entra_token_of(token, tid, oid, audience) -> bool:
         claims.get("tid") == tid and claims.get("oid") == oid and claims.get("aud") in (audience, f"api://{audience}")
 
 
+def broker_token_of(token, tid, oid, audience) -> bool:
+    """Is ``token`` (from Keycloak's broker endpoint) an Entra v2 access token of exactly this person, issued for the
+    platform API ``audience`` itself? Stricter than ``entra_token_of``: v2 only, the client id as audience."""
+    claims = _claims(token)
+    return claims is not None and bool(audience) and claims.get("ver") == "2.0" and \
+        claims.get("iss") == _ENTRA_V2.format(tid=tid) and claims.get("tid") == tid and claims.get("oid") == oid and \
+        claims.get("aud") == audience
+
+
+def _hardened_session():
+    """requests.Session that ignores proxy settings from the environment and follows no redirect."""
+    session = requests.Session()
+    session.trust_env = False
+    session.max_redirects = 0
+    session.proxies = {}
+    return session
+
+
+def _read_bounded(response, limit, deadline):
+    """The body, or None when it is larger than ``limit`` bytes or arrives after ``deadline`` (monotonic)."""
+    chunks, size = [], 0
+    for chunk in response.iter_content(chunk_size=8192):
+        size += len(chunk)
+        if size > limit or time.monotonic() > deadline:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 class Method:  # pylint: disable=E1101,R0903
     """ Methods """
 
@@ -105,25 +152,64 @@ class Method:  # pylint: disable=E1101,R0903
         return key if len(key) >= MIN_REQUEST_KEY_CHARS else ""
 
     @web.method()
+    def obo_assertion_source(self):
+        """ Where the Microsoft sign-in comes from: "login" (default: the login is Entra's own) or "keycloak_broker"
+        (Keycloak brokered it to Entra); None for any other value """
+        source = self.descriptor.config.get("obo_assertion_source") or "login"
+        return source if source in SOURCES else None
+
+    @web.method()
+    def obo_broker_url(self):
+        """ The realm's broker token endpoint for ``obo_broker_alias``, on the host of the configured issuer; None
+        when it cannot be built safely (https only; http only for localhost names with obo_broker_insecure_dev_http) """
+        config = self.descriptor.config
+        issuer, alias = config.get("issuer"), config.get("obo_broker_alias")
+        if not isinstance(issuer, str) or not isinstance(alias, str) or not _ALIAS.match(alias):
+            return None
+        parts = urlsplit(issuer)
+        host = parts.hostname or ""
+        local = host == "localhost" or host.endswith(".localhost")
+        if parts.scheme != "https" and not (
+                parts.scheme == "http" and local and config.get("obo_broker_insecure_dev_http") is True):
+            return None
+        if not host or parts.username or parts.password or parts.query or parts.fragment:
+            return None
+        return f"{issuer.rstrip('/')}/broker/{alias}/token"
+
+    @web.method()
+    def obo_custody_problems(self):
+        """ What custody switched on still needs: [] when it is fully configured """
+        config = self.descriptor.config
+        problems = [name for name, value in (("the request key", self.obo_request_key()),
+                                             ("obo_api_client_id", config.get("obo_api_client_id"))) if not value]
+        source = self.obo_assertion_source()
+        if source is None:
+            problems.append("a known obo_assertion_source (login or keycloak_broker)")
+        elif source == "keycloak_broker" and self.obo_broker_url() is None:
+            problems.append("a broker token endpoint (an https issuer and a valid obo_broker_alias)")
+        return problems
+
+    @web.method()
     def check_obo_custody_config(self):
-        """ At init: custody switched on needs the request key and the platform API's client id; without them nothing
-        is kept (an ERROR says why). True when custody is off or fully configured. """
+        """ At init: custody switched on needs the request key and the platform API's client id (and, brokered, the
+        broker endpoint); without them nothing is kept (an ERROR says why). True when custody is off or fully
+        configured. """
         if not self.descriptor.config.get("obo_custody_enabled", False):
             return True
-        missing = [name for name, value in (("the request key", self.obo_request_key()),
-                                            ("obo_api_client_id", self.descriptor.config.get("obo_api_client_id")))
-                   if not value]
+        missing = self.obo_custody_problems()
         if missing:
             log.error("OBO custody is enabled but %s is missing: no Microsoft sign-in is kept", " and ".join(missing))
             return False
+        if self.obo_assertion_source() == "keycloak_broker" and self.obo_broker_refresh_client() is None:
+            log.warning("OBO custody (brokered) has no refresh client: a sign-in serves runs until its Microsoft "
+                        "token expires, then the person signs in again")
         return True
 
     @web.method()
     def obo_custody_store(self):
         """ The session Redis when custody is switched on and configured (``check_obo_custody_config``), else None:
         a custody nobody could ask for is never kept """
-        if not self.descriptor.config.get("obo_custody_enabled", False) or not self.obo_request_key() or \
-                not self.descriptor.config.get("obo_api_client_id"):
+        if not self.descriptor.config.get("obo_custody_enabled", False) or self.obo_custody_problems():
             return None
         interface = getattr(getattr(self.context, "app", None), "session_interface", None)
         return getattr(interface, "client", None)
@@ -161,6 +247,8 @@ class Method:  # pylint: disable=E1101,R0903
                 return False
             tid, oid = identity.get("tid"), identity.get("oid")
             key = self.obo_custody_key(tid, oid)
+            if key is not None and self.obo_assertion_source() == "keycloak_broker":
+                return self.keep_brokered_custody(store, key, identity, delegation)
             if key is None or identity.get("issuer") != _ENTRA_V2.format(tid=tid) or not entra_token_of(
                     delegation.get("access_token"), tid, oid, self.descriptor.config.get("obo_api_client_id")):
                 return False
@@ -174,6 +262,83 @@ class Method:  # pylint: disable=E1101,R0903
         except Exception as exception:  # pylint: disable=W0703
             log.error("OBO custody was not kept: %s", type(exception).__name__)
             return False
+
+    @web.method()
+    def keep_brokered_custody(self, store, key, identity, delegation):
+        """ Keycloak brokered the login: fetch Entra's token response from the realm with the session's Keycloak
+        access token and keep it, as the login source keeps its own, when it is the very person's v2 token for the
+        platform API. Otherwise nothing is kept and one WARNING (no claim, no token) says why. """
+        tid, oid = identity["tid"], identity["oid"]
+        if identity.get("issuer") != self.descriptor.config.get("issuer"):
+            return False   # only a login this plugin verified against the configured realm
+        body = self.fetch_broker_token(delegation.get("access_token"))
+        if body is None:
+            return False
+        access_token = body.get("access_token")
+        if not broker_token_of(access_token, tid, oid, self.descriptor.config.get("obo_api_client_id")):
+            log.warning("OBO custody was not kept: the brokered Microsoft token is not a v2 token of this person "
+                        "for the platform API")
+            return False
+        expires_at = _claims(access_token).get("exp")
+        refresh_token = body.get("refresh_token")
+        record = {
+            "issuer": identity["issuer"], "tid": tid, "oid": oid, "assertion_source": "broker",
+            "access_token": access_token,
+            "refresh_token": refresh_token if isinstance(refresh_token, str) and
+            0 < len(refresh_token) <= MAX_TOKEN_CHARS else None,
+            "expires_at": expires_at if isinstance(expires_at, int) and not isinstance(expires_at, bool) else None,
+        }
+        store.set(key, json.dumps(record), ex=self.obo_custody_ttl())
+        return True
+
+    @web.method()
+    def fetch_broker_token(self, access_token):
+        """ Keycloak's stored Entra token response for the session's person: one GET to the broker token endpoint,
+        bearer = the session's Keycloak access token, no body; hardened (the issuer's host only, no redirect, no proxy
+        from the environment, TLS verified, a connect/read timeout, at most BROKER_TOTAL_S and MAX_BROKER_BYTES).
+        The parsed token response, or None after one WARNING. The answer is never logged. """
+        url = self.obo_broker_url()
+        if url is None or not isinstance(access_token, str) or not 0 < len(access_token) <= MAX_TOKEN_CHARS:
+            log.warning("OBO custody was not kept: no broker endpoint or session token to fetch the Microsoft "
+                        "sign-in with")
+            return None
+        deadline = time.monotonic() + BROKER_TOTAL_S
+        try:
+            with _hardened_session() as session:
+                response = session.get(url, headers={"Authorization": f"Bearer {access_token}",
+                                                     "Accept": "application/json"},
+                                       timeout=(CONNECT_TIMEOUT_S, HTTP_TIMEOUT_S), allow_redirects=False,
+                                       verify=True, stream=True)
+                with response:
+                    status = response.status_code
+                    raw = _read_bounded(response, MAX_BROKER_BYTES, deadline) if status == 200 else None
+        except Exception as exception:  # pylint: disable=W0703
+            log.warning("OBO custody was not kept: the broker token endpoint failed (%s)", type(exception).__name__)
+            return None
+        if status != 200:
+            log.warning("OBO custody was not kept: the broker token endpoint answered %s (%s)", status,
+                        BROKER_REFUSALS.get(status, "unexpected answer"))
+            return None
+        try:
+            body = json.loads(raw) if raw is not None else None
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            log.warning("OBO custody was not kept: the broker token endpoint answered no token response (too large, "
+                        "too slow or not JSON)")
+            return None
+        return body
+
+    @web.method()
+    def obo_broker_refresh_client(self):
+        """ (client id, client secret, scope) of the Entra client Keycloak brokers through, for refreshing a brokered
+        record at the Entra authority; None unless all three are configured (the secret from the environment
+        variable named by obo_broker_refresh_client_secret_env) """
+        config = self.descriptor.config
+        name = config.get("obo_broker_refresh_client_secret_env")
+        secret = os.environ.get(name) if isinstance(name, str) and name else None
+        found = (config.get("obo_broker_refresh_client_id"), secret, config.get("obo_broker_refresh_scope"))
+        return found if all(isinstance(value, str) and value for value in found) else None
 
     @web.method()
     def drop_obo_custody(self, identity):
@@ -192,26 +357,33 @@ class Method:  # pylint: disable=E1101,R0903
     @web.method()
     def refresh_obo_custody(self, record):
         """ A new access token for the record, with its refresh token and this plugin's login client, through a
-        hardened request (https, the configured token endpoint's host only, no redirect, no proxy from the
-        environment, a timeout). The updated record, or None. """
+        hardened request (https, the configured token endpoint's host only — for a brokered record the Entra
+        authority of its tenant with the obo_broker_refresh client —, no redirect, no proxy from the environment, a
+        timeout). The updated record, or None. """
         refresh_token = record.get("refresh_token")
-        endpoint = self.descriptor.config.get("token_endpoint")
-        parts = urlsplit(endpoint or "")
-        if not refresh_token or parts.scheme != "https" or parts.hostname != AUTHORITY_HOST or \
-                parts.port not in (None, 443):
-            return None   # custody is Entra-only, so its refresh goes to the Entra authority only
         config = self.descriptor.config
-        data = {"grant_type": "refresh_token", "refresh_token": refresh_token,
-                "scope": config.get("scope", config.get("target_scope", "openid profile email"))}
-        auth = None
-        if config.get("token_endpoint_auth", "basic") == "basic":
-            auth = (config["client_id"], config["client_secret"])
+        if record.get("assertion_source") == "broker":
+            # the record came through Keycloak; its refresh token is Entra's, for the client Keycloak brokers through
+            client, tid = self.obo_broker_refresh_client(), record.get("tid")
+            if not refresh_token or client is None or not isinstance(tid, str) or not _GUID.match(tid):
+                return None
+            endpoint, auth, valid = f"https://{AUTHORITY_HOST}/{tid}/oauth2/v2.0/token", None, broker_token_of
+            data = {"grant_type": "refresh_token", "refresh_token": refresh_token, "scope": client[2],
+                    "client_id": client[0], "client_secret": client[1]}
         else:
-            data.update(client_id=config["client_id"], client_secret=config["client_secret"])
-        session = requests.Session()
-        session.trust_env = False
-        session.max_redirects = 0
-        session.proxies = {}
+            endpoint, valid = config.get("token_endpoint"), entra_token_of
+            parts = urlsplit(endpoint or "")
+            if not refresh_token or parts.scheme != "https" or parts.hostname != AUTHORITY_HOST or \
+                    parts.port not in (None, 443):
+                return None   # custody is Entra-only, so its refresh goes to the Entra authority only
+            data = {"grant_type": "refresh_token", "refresh_token": refresh_token,
+                    "scope": config.get("scope", config.get("target_scope", "openid profile email"))}
+            auth = None
+            if config.get("token_endpoint_auth", "basic") == "basic":
+                auth = (config["client_id"], config["client_secret"])
+            else:
+                data.update(client_id=config["client_id"], client_secret=config["client_secret"])
+        session = _hardened_session()
         try:
             with session:
                 response = session.post(endpoint, data=data, auth=auth, timeout=HTTP_TIMEOUT_S, allow_redirects=False,
@@ -220,8 +392,8 @@ class Method:  # pylint: disable=E1101,R0903
         except Exception as exception:  # pylint: disable=W0703
             log.error("OBO custody refresh failed: %s", type(exception).__name__)
             return None
-        if not isinstance(body, dict) or not entra_token_of(body.get("access_token"), record["tid"], record["oid"],
-                                                            config.get("obo_api_client_id")):
+        if not isinstance(body, dict) or not valid(body.get("access_token"), record["tid"], record["oid"],
+                                                   config.get("obo_api_client_id")):
             log.warning("OBO custody refresh was refused (status %s)", getattr(response, "status_code", None))
             return None
         try:
