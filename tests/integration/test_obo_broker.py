@@ -57,8 +57,8 @@ class Redis:
     def __init__(self):
         self.values, self.ttls, self.calls = {}, {}, []
 
-    def set(self, key, value, ex=None, keepttl=False, nx=False):
-        if nx and key in self.values:
+    def set(self, key, value, ex=None, keepttl=False, nx=False, xx=False):
+        if (nx and key in self.values) or (xx and key not in self.values):
             return None
         if ":nonce:" not in key:
             self.calls.append(("set", key, ex, keepttl))
@@ -73,9 +73,28 @@ class Redis:
     def ttl(self, key):
         return (self.ttls.get(key) or -1) if key in self.values else -2
 
+    def pipeline(self, transaction=True):
+        return Pipeline(self)
+
     def delete(self, key):
         self.calls.append(("delete", key))
         self.values.pop(key, None)
+
+
+class Pipeline:
+    """MULTI/EXEC as the RPC uses it: the queued reads answered together."""
+
+    def __init__(self, redis):
+        self.redis, self.queued = redis, []
+
+    def get(self, key):
+        self.queued.append(("get", key))
+
+    def ttl(self, key):
+        self.queued.append(("ttl", key))
+
+    def execute(self):
+        return [getattr(self.redis, name)(key) for name, key in self.queued]
 
 
 class Response:

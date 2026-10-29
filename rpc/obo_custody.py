@@ -49,7 +49,10 @@ class RPC:  # pylint: disable=R0903,E1101
             if not self.obo_request_signed(store, tid, oid, bool(refresh), iat, nonce, signature):
                 log.warning("OBO assertion request refused")
                 return {"ok": False, "code": "REQUEST_REFUSED"}
-            raw = store.get(key)
+            pipe = store.pipeline(transaction=True)   # the record and its remaining lifetime, read together
+            pipe.get(key)
+            pipe.ttl(key)
+            raw, ttl = pipe.execute()
             record = json.loads(raw) if raw else None
             if not isinstance(record, dict) or (record.get("tid"), record.get("oid")) != (tid, oid) or \
                     not entra_token_of(record.get("access_token"), tid, oid,
@@ -60,11 +63,16 @@ class RPC:  # pylint: disable=R0903,E1101
                 record = self.refresh_obo_custody(record)
                 if record is None:
                     return dict(UNAVAILABLE)
-                store.set(key, json.dumps(record), keepttl=True)   # the custody's own lifetime is not extended
+                # the custody's own lifetime is not extended, and a custody that ended meanwhile is not brought back
+                if not store.set(key, json.dumps(record), keepttl=True, xx=True):
+                    return dict(UNAVAILABLE)
                 log.info("OBO custody refreshed")
-            ttl = store.ttl(key)
+            if not isinstance(ttl, int) or ttl == -2 or ttl == 0:
+                return dict(UNAVAILABLE)   # it ended between the reads
+            # a custody with no lifetime (never written so) is treated as ending now: Main keeps nothing minted from it
+            ends = int(time.time()) + (ttl if ttl > 0 else 0)
             return {"ok": True, "assertion": record["access_token"], "expires_at": record.get("expires_at"),
-                    "custody_expires_at": int(time.time()) + ttl if isinstance(ttl, int) and ttl > 0 else None}
+                    "custody_expires_at": ends}
         except Exception as exception:  # pylint: disable=W0703
             log.error("OBO assertion failed: %s", type(exception).__name__)
             return dict(UNAVAILABLE)
