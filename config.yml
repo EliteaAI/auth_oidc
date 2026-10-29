@@ -35,3 +35,16 @@ client_secret: ""
 # With none of the three above the plugin refuses to start. This opts in to
 # accepting unsigned ID tokens (insecure; logs an ERROR at start and at every login).
 # allow_unverified_id_token: false
+
+# On-behalf-of custody (C-1009 #6756 step 4). When on, a Microsoft (Entra v2) sign-in is also kept under the person's
+# subject in the session Redis, so a credential release can exchange it on their behalf while they are signed in
+# (elitea_core asks for it over RPC auth_oidc_obo_assertion). The scope above must then ask for the platform API's
+# access_as_user scope and offline_access. Logout drops it.
+# Each request is signed with a key shared with elitea_core only (32+ characters, from the environment variable named
+# here; give it to pylon_auth and pylon_main only, never through an env file every pylon loads). obo_api_client_id is
+# the platform API's client id: only a sign-in token for it is kept. Missing key or id: nothing is kept (ERROR at init).
+# Custody lives as long as the session does.
+# obo_custody_enabled: false
+# obo_api_client_id: <platform API client id>
+# obo_custody_key_env: ELITEA_OBO_CUSTODY_KEY
+# obo_custody_prefix: c1009_obo_custody:

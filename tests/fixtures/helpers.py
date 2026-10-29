@@ -11,7 +11,7 @@ from typing import Any
 # from the real files without __init__ running.
 PACKAGE_NAME = "auth_oidc_under_test"
 
-SUBPACKAGES = ("methods", "routes")
+SUBPACKAGES = ("methods", "routes", "rpc")
 
 
 class Log:

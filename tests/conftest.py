@@ -165,8 +165,23 @@ class Descriptor:
         return ("TEMPLATE", name, kwargs)
 
 
+@pytest.fixture(scope="session")
+def custody_mod(plugin_root):
+    return helpers.import_plugin_module(plugin_root, "methods.obo_custody")
+
+
+@pytest.fixture(scope="session")
+def custody_rpc_mod(plugin_root):
+    return helpers.import_plugin_module(plugin_root, "rpc.obo_custody")
+
+
+@pytest.fixture(scope="session")
+def logout_mod(plugin_root):
+    return helpers.import_plugin_module(plugin_root, "routes.logout")
+
+
 @pytest.fixture
-def build_module(module_mod, jwt_mod, tools_mod, id_token_mod, login_mod):
+def build_module(module_mod, jwt_mod, tools_mod, id_token_mod, login_mod, custody_mod, custody_rpc_mod, logout_mod):
     """An auth_oidc module bound to a config, with every Method/Route mixed in.
 
     Pylon merges every methods/*.py and routes/*.py class onto the one Module
@@ -174,7 +189,7 @@ def build_module(module_mod, jwt_mod, tools_mod, id_token_mod, login_mod):
     """
     class Subject(
             module_mod.Module, jwt_mod.Method, tools_mod.Method,
-            id_token_mod.Method, login_mod.Route,
+            id_token_mod.Method, login_mod.Route, logout_mod.Route, custody_mod.Method, custody_rpc_mod.RPC,
     ):
         pass
 

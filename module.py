@@ -42,6 +42,7 @@ class Module(module.ModuleModel):
         self.descriptor.init_methods()
         self.check_id_token_config()
         self.check_subject_config()
+        self.check_obo_custody_config()   # custody without its key or audience keeps nothing (#6756)
         # Init
         self.descriptor.init_all(
             url_prefix=auth_core.get_relative_url_prefix(
