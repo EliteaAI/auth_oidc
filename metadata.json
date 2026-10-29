@@ -1,6 +1,6 @@
 {
   "name": "Auth OIDC Plugin",
-  "version": "0.6",
+  "version": "0.7",
   "depends_on": [
     "auth_core"
   ]
