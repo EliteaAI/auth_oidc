@@ -33,8 +33,9 @@ class RPC:  # pylint: disable=R0903,E1101
     def obo_assertion(self, tid, oid, refresh=False, iat=None, nonce=None, signature=None):  # pylint: disable=R0913
         """ The Entra access token of the person ``(tid, oid)``, for elitea_core's credential release to exchange:
         ``{"ok": True, "assertion", "expires_at"}``, or ``{"ok": False, "code": "ASSERTION_UNAVAILABLE"}`` when no
-        Microsoft sign-in of theirs is kept (signed out, expired, a Keycloak login, custody off) or it cannot be
-        renewed. ``refresh``: renew it first with the stored refresh token (an exchange refused it as expired).
+        Microsoft sign-in of theirs is kept (signed out, expired, a login that is neither Entra's nor brokered to it,
+        custody off) or it cannot be renewed. ``refresh``: renew it first with the stored refresh token (an exchange
+        refused it as expired).
         ``iat``, ``nonce``, ``signature``: elitea_core's signature over the request (``obo_request_signed``); without
         a good one the answer is ``REQUEST_REFUSED``. Never raises; never logs a token. """
         try:

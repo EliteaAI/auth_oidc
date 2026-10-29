@@ -42,7 +42,6 @@ class Module(module.ModuleModel):
         self.descriptor.init_methods()
         self.check_id_token_config()
         self.check_subject_config()
-        self.check_obo_custody_config()   # custody without its key or audience keeps nothing (#6756)
         # Init
         self.descriptor.init_all(
             url_prefix=auth_core.get_relative_url_prefix(
@@ -57,6 +56,9 @@ class Module(module.ModuleModel):
         )
         # Use metadata endpoint if set in config
         self.get_metadata()
+        # custody without its key or audience keeps nothing (#6756); after discovery: the broker endpoint (4b) is
+        # built from the discovered token endpoint
+        self.check_obo_custody_config()
 
     def reconfig(self):
         """ Re-config module """
