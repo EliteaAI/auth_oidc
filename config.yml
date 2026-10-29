@@ -51,8 +51,9 @@ client_secret: ""
 #
 # Where the Microsoft sign-in comes from (step 4b). "login" (default): this plugin's login is Entra's own.
 # "keycloak_broker": the login is a Keycloak realm (issuer above) that brokers to Entra through the identity provider
-# obo_broker_alias, with Store tokens on and the broker read-token role in the realm's default roles; right after
-# the login one call to <issuer>/broker/<alias>/token fetches Entra's token response and keeps it the same way.
+# obo_broker_alias, with Store tokens on and broker read-token added to this client's tokens only (runbook:
+# docs/keycloak-broker/RUNBOOK.md); right after the login one call to <realm>/broker/<alias>/token, on the host of the
+# realm's token endpoint (from discovery), fetches Entra's token response and keeps it the same way.
 # subject_claims must then name the claims the realm maps Entra's tid and oid to. https only; http is accepted for
 # localhost names only, with obo_broker_insecure_dev_http: true (local overlay).
 # A brokered sign-in is refreshed at the Entra authority with the Entra client Keycloak brokers through (its id, the

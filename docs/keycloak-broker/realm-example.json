@@ -1,0 +1,184 @@
+{
+  "realm": "elitea",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "accessTokenLifespan": 1800,
+  "components": {
+    "org.keycloak.userprofile.UserProfileProvider": [
+      {
+        "providerId": "declarative-user-profile",
+        "subComponents": {},
+        "config": {
+          "kc.user.profile.config": [
+            "{\"attributes\":[{\"name\":\"username\",\"displayName\":\"Username\",\"validations\":{\"length\":{\"min\":3,\"max\":255},\"username-prohibited-characters\":{},\"up-username-not-idn-homograph\":{}},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]},\"multivalued\":false},{\"name\":\"email\",\"displayName\":\"Email\",\"validations\":{\"email\":{},\"length\":{\"max\":255}},\"required\":{\"roles\":[\"user\"]},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]},\"multivalued\":false},{\"name\":\"firstName\",\"displayName\":\"First name\",\"validations\":{\"length\":{\"max\":255},\"person-name-prohibited-characters\":{}},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]},\"multivalued\":false},{\"name\":\"lastName\",\"displayName\":\"Last name\",\"validations\":{\"length\":{\"max\":255},\"person-name-prohibited-characters\":{}},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]},\"multivalued\":false},{\"name\":\"entra_tid\",\"displayName\":\"Entra tenant id\",\"permissions\":{\"view\":[\"admin\"],\"edit\":[\"admin\"]},\"multivalued\":false},{\"name\":\"entra_oid\",\"displayName\":\"Entra object id\",\"permissions\":{\"view\":[\"admin\"],\"edit\":[\"admin\"]},\"multivalued\":false}],\"groups\":[{\"name\":\"user-metadata\",\"displayHeader\":\"User metadata\",\"displayDescription\":\"Attributes, which refer to user metadata\"}]}"
+          ]
+        }
+      }
+    ]
+  },
+  "identityProviders": [
+    {
+      "alias": "entra",
+      "displayName": "Microsoft (organisation)",
+      "providerId": "oidc",
+      "enabled": true,
+      "trustEmail": true,
+      "storeToken": true,
+      "addReadTokenRoleOnCreate": false,
+      "authenticateByDefault": false,
+      "linkOnly": false,
+      "firstBrokerLoginFlowAlias": "first broker login",
+      "config": {
+        "issuer": "https://login.microsoftonline.com/${KC_ENTRA_TENANT_ID}/v2.0",
+        "authorizationUrl": "https://login.microsoftonline.com/${KC_ENTRA_TENANT_ID}/oauth2/v2.0/authorize",
+        "tokenUrl": "https://login.microsoftonline.com/${KC_ENTRA_TENANT_ID}/oauth2/v2.0/token",
+        "jwksUrl": "https://login.microsoftonline.com/${KC_ENTRA_TENANT_ID}/discovery/v2.0/keys",
+        "logoutUrl": "https://login.microsoftonline.com/${KC_ENTRA_TENANT_ID}/oauth2/v2.0/logout",
+        "useJwksUrl": "true",
+        "validateSignature": "true",
+        "clientId": "${KC_ENTRA_CLIENT_ID}",
+        "clientSecret": "${KC_ENTRA_CLIENT_SECRET}",
+        "clientAuthMethod": "client_secret_post",
+        "defaultScope": "openid profile email offline_access api://elitea-api/access_as_user",
+        "pkceEnabled": "true",
+        "pkceMethod": "S256",
+        "disableUserInfo": "true",
+        "syncMode": "FORCE"
+      }
+    }
+  ],
+  "identityProviderMappers": [
+    {
+      "name": "entra tid",
+      "identityProviderAlias": "entra",
+      "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+      "config": {
+        "syncMode": "FORCE",
+        "claim": "tid",
+        "user.attribute": "entra_tid"
+      }
+    },
+    {
+      "name": "entra oid",
+      "identityProviderAlias": "entra",
+      "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+      "config": {
+        "syncMode": "FORCE",
+        "claim": "oid",
+        "user.attribute": "entra_oid"
+      }
+    },
+    {
+      "name": "email",
+      "identityProviderAlias": "entra",
+      "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+      "config": {
+        "syncMode": "FORCE",
+        "claim": "email",
+        "user.attribute": "email"
+      }
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "elitea-web-local",
+      "name": "Elitea local web client",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "local-dev-not-a-secret",
+      "protocol": "openid-connect",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": [
+        "http://localhost/forward-auth/auth_oidc/login_callback"
+      ],
+      "webOrigins": [
+        "http://localhost"
+      ],
+      "protocolMappers": [
+        {
+          "name": "entra tid",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "entra_tid",
+            "claim.name": "tid",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true",
+            "multivalued": "false"
+          }
+        },
+        {
+          "name": "entra oid",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "entra_oid",
+            "claim.name": "oid",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true",
+            "multivalued": "false"
+          }
+        },
+        {
+          "name": "broker read-token",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "role": "broker.read-token"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "id": "0a3c1d2e-1111-4111-8111-000000000003",
+      "username": "admin",
+      "email": "admin@centry.user",
+      "emailVerified": true,
+      "firstName": "Admin",
+      "lastName": "Local",
+      "enabled": true,
+      "realmRoles": [
+        "default-roles-elitea"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "admin-local-not-a-secret",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "0a3c1d2e-1111-4111-8111-000000000005",
+      "username": "u1",
+      "email": "u1@elitea.local",
+      "emailVerified": true,
+      "firstName": "U1",
+      "lastName": "Local",
+      "enabled": true,
+      "realmRoles": [
+        "default-roles-elitea"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "u1-local-not-a-secret",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

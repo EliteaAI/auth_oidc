@@ -131,7 +131,7 @@ class Session:
     def post(self, url, **kwargs):
         self.http.posts.append((url, self._seen(kwargs)))
         status, body = self.http.refresh
-        return Response(status, body=body)
+        return Response(status, [json.dumps(body).encode()])
 
 
 class LoginEndpoint:
@@ -266,7 +266,8 @@ def test_a_brokered_sign_in_is_fetched_once_and_kept_as_the_same_record(make, fl
     assert sign_in(module, flask, login_endpoint, signing_key)[0] == "SUCCESS"
     [(url, kwargs)] = http.gets
     assert url == BROKER_URL
-    assert kwargs["headers"] == {"Authorization": f"Bearer {KC_ACCESS}", "Accept": "application/json"}
+    assert kwargs["headers"] == {"Authorization": f"Bearer {KC_ACCESS}", "Accept": "application/json",
+                                 "Accept-Encoding": "identity"}
     assert not {"data", "json", "params"} & set(kwargs)                       # no body, no query
     assert (kwargs["allow_redirects"], kwargs["verify"], kwargs["stream"], kwargs["timeout"]) == (False, True, True,
                                                                                                     (3, 4))
@@ -366,16 +367,84 @@ def test_a_keycloak_identity_that_differs_from_the_entra_token_keeps_nothing(mak
     assert redis.values == {} and not any(KEY.rsplit(":", 1)[0] in key for key in redis.values)
 
 
-def test_only_a_login_verified_against_the_configured_realm_is_brokered(make, http, redis):
-    module = make()
-    identity = {"issuer": "https://other.example/realms/elitea", "tid": TID, "oid": OID, "sub": "kc-user-1"}
-    assert module.keep_obo_custody(identity, {"access_token": KC_ACCESS}) is False
-    assert http.gets == [] and redis.values == {}
-
-
-def test_a_local_user_without_entra_claims_is_never_brokered(make, flask, login_endpoint, http, signing_key, redis):
+def test_a_local_user_without_entra_claims_is_never_brokered_and_one_warning_says_so(make, flask, login_endpoint,
+                                                                                     http, signing_key, redis, log):
     sign_in(make(), flask, login_endpoint, signing_key, tid=None, oid=None)
     assert http.gets == [] and redis.values == {}
+    assert warnings(log) == ["OBO custody was not kept: the realm's token carries no Entra identity (a realm user who "
+                             "did not sign in through the Microsoft broker)"]
+
+
+def test_a_login_of_another_realm_is_refused_with_one_warning(make, http, redis, log):
+    identity = {"issuer": "https://other.example/realms/elitea", "tid": TID, "oid": OID, "sub": "kc-user-1"}
+    assert make().keep_obo_custody(identity, {"access_token": KC_ACCESS}) is False
+    assert http.gets == [] and warnings(log) == ["OBO custody was not kept: the login is not one of the configured "
+                                                 "realm"]
+
+
+@pytest.mark.parametrize("status", [400, 403, 404])
+def test_a_refused_next_login_drops_the_earlier_custody_of_the_person(make, flask, login_endpoint, http, signing_key,
+                                                                      redis, log, status):
+    module = make()
+    sign_in(module, flask, login_endpoint, signing_key)
+    assert KEY in redis.values
+    log.clear()
+    http.broker = (status, [b"{}"], {})
+    sign_in(module, flask, login_endpoint, signing_key)
+    assert KEY not in redis.values
+    assert module.events == [("auth_oidc_obo_custody_dropped", {"tid": TID, "oid": OID})]   # Main drops its tokens
+    [line] = warnings(log)
+    assert str(status) in line and "earlier sign-in of the person is dropped" in line and OID not in line
+
+
+@pytest.mark.parametrize("broker", [(500, [b"{}"], {}), (200, [b"not json"], {})])
+def test_a_transient_failure_of_the_next_login_keeps_the_earlier_custody(make, flask, login_endpoint, http,
+                                                                         signing_key, redis, broker):
+    module = make()
+    sign_in(module, flask, login_endpoint, signing_key)
+    http.broker = broker
+    sign_in(module, flask, login_endpoint, signing_key)
+    assert json.loads(redis.values[KEY])["access_token"] == ENTRA_ACCESS and module.events == []
+
+
+@pytest.mark.parametrize("exp", [int(time.time()) - 60, int(time.time()) + 30, None])
+def test_an_expired_brokered_token_is_renewed_at_entra_when_the_refresh_client_is_set(make, flask, login_endpoint,
+                                                                                      http, signing_key, redis, log,
+                                                                                      exp):
+    stale = jwt(iss=ENTRA, ver="2.0", tid=TID, oid=OID, aud=API, **({} if exp is None else {"exp": exp}))
+    http.broker = (200, [json.dumps(stored(access_token=stale)).encode()], {})
+    sign_in(make(), flask, login_endpoint, signing_key)
+    assert json.loads(redis.values[KEY])["access_token"] == NEW_ENTRA_ACCESS
+    [(url, _)] = http.posts
+    assert url == f"https://login.microsoftonline.com/{TID}/oauth2/v2.0/token"
+    assert any("had expired and was renewed" in text for level, text, _ in log.records if level == "info")
+    assert_nothing_secret_logged(log)
+
+
+def test_an_expired_brokered_token_without_a_refresh_client_keeps_nothing(make, flask, login_endpoint, http,
+                                                                          signing_key, redis, log):
+    stale = jwt(iss=ENTRA, ver="2.0", tid=TID, oid=OID, aud=API, exp=int(time.time()) - 60)
+    http.broker = (200, [json.dumps(stored(access_token=stale)).encode()], {})
+    sign_in(make(obo_broker_refresh_client_id=None), flask, login_endpoint, signing_key)
+    assert redis.values == {} and http.posts == []
+    assert warnings(log)[-1] == ("OBO custody was not kept: the brokered Microsoft token has expired and no refresh "
+                                 "client is configured")
+
+
+def test_an_expired_brokered_token_whose_renewal_is_refused_keeps_nothing(make, flask, login_endpoint, http,
+                                                                          signing_key, redis, log):
+    stale = jwt(iss=ENTRA, ver="2.0", tid=TID, oid=OID, aud=API, exp=int(time.time()) - 60)
+    http.broker = (200, [json.dumps(stored(access_token=stale)).encode()], {})
+    http.refresh = (400, {"error": "invalid_grant"})
+    sign_in(make(), flask, login_endpoint, signing_key)
+    assert redis.values == {} and "could not be renewed" in warnings(log)[-1]
+
+
+def test_an_oversized_brokered_refresh_answer_is_refused(make, flask, login_endpoint, http, signing_key, redis):
+    module = make()
+    sign_in(module, flask, login_endpoint, signing_key)
+    http.refresh = (200, {"access_token": NEW_ENTRA_ACCESS, "padding": "x" * 70_000})
+    assert module.obo_assertion(**signed(TID, OID, refresh=True)) == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
 
 
 # --- configuration fails closed --------------------------------------------------------------------------------------
@@ -385,10 +454,13 @@ def test_a_local_user_without_entra_claims_is_never_brokered(make, flask, login_
     {"obo_broker_alias": None},
     {"obo_broker_alias": "../admin"},
     {"obo_broker_alias": "entra/token?x="},
-    {"issuer": "http://keycloak.example/realms/elitea"},                   # plain http to a real host
-    {"issuer": "http://keycloak.localhost:8082/realms/elitea"},            # http without the dev flag
-    {"issuer": "https://user:pw@keycloak.example/realms/elitea"},
-    {"issuer": "https://keycloak.example/realms/elitea?x=1"},
+    {"token_endpoint": "http://keycloak.example/realms/elitea/protocol/openid-connect/token"},   # http, real host
+    {"token_endpoint": "http://keycloak.localhost:8082/realms/elitea/protocol/openid-connect/token"},   # no dev flag
+    {"token_endpoint": "https://user:pw@keycloak.example/realms/elitea/protocol/openid-connect/token"},
+    {"token_endpoint": "https://keycloak.example/realms/elitea/protocol/openid-connect/token?x=1"},
+    {"token_endpoint": "https://keycloak.example/realms/other/protocol/openid-connect/token"},  # another realm
+    {"token_endpoint": "https://login.example.com/oauth2/v2.0/token"},     # not a Keycloak realm's token endpoint
+    {"token_endpoint": ""},                                                # discovery found none
 ])
 def test_a_broker_configuration_that_cannot_be_trusted_keeps_nothing_and_says_so(make, flask, login_endpoint, http,
                                                                                   signing_key, redis, log, config):
@@ -396,17 +468,19 @@ def test_a_broker_configuration_that_cannot_be_trusted_keeps_nothing_and_says_so
     log.clear()
     assert module.check_obo_custody_config() is False
     assert any(level == "error" and "OBO custody is enabled" in text for level, text, _ in log.records)
-    if "issuer" not in config:
-        sign_in(module, flask, login_endpoint, signing_key)
-        assert http.gets == [] and redis.values == {}
+    sign_in(module, flask, login_endpoint, signing_key)
+    assert http.gets == [] and redis.values == {}
 
 
 def test_http_is_accepted_for_a_localhost_realm_with_the_dev_flag_only(make):
-    local = "http://keycloak.localhost:8082/realms/elitea"
-    assert make(issuer=local, obo_broker_insecure_dev_http=True).obo_broker_url() == f"{local}/broker/entra/token"
-    assert make(issuer=local, obo_broker_insecure_dev_http="true").obo_broker_url() is None   # an explicit true only
-    assert make(issuer="http://keycloak.example/realms/elitea", obo_broker_insecure_dev_http=True).obo_broker_url() \
-        is None
+    """The overlay: browser-facing issuer on localhost, token endpoint (from discovery) on the Docker alias."""
+    issuer, back = "http://localhost:8082/realms/elitea", "http://keycloak.localhost:8082/realms/elitea"
+    endpoint = f"{back}/protocol/openid-connect/token"
+    assert make(issuer=issuer, token_endpoint=endpoint, obo_broker_insecure_dev_http=True).obo_broker_url() == \
+        f"{back}/broker/entra/token"
+    assert make(issuer=issuer, token_endpoint=endpoint, obo_broker_insecure_dev_http="true").obo_broker_url() is None
+    assert make(issuer=issuer, token_endpoint="http://keycloak.example/realms/elitea/protocol/openid-connect/token",
+                obo_broker_insecure_dev_http=True).obo_broker_url() is None
 
 
 def test_a_complete_broker_configuration_passes_the_init_check(make, log):
@@ -486,3 +560,11 @@ def test_the_login_source_still_refuses_a_keycloak_issuer(make, flask, login_end
     sign_in(module, flask, login_endpoint, signing_key)
     assert http.gets == [] and redis.values == {}
 
+
+
+def test_the_custody_check_runs_after_discovery_fills_the_token_endpoint(make):
+    module, order = make(), []
+    module.get_metadata = lambda: order.append("discovery")
+    module.check_obo_custody_config = lambda: order.append("custody check") or True
+    module.init()
+    assert order == ["discovery", "custody check"]

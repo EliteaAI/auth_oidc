@@ -96,7 +96,24 @@ class Session:
         self.endpoint.posts.append((url, {**kwargs, "_trust_env": self.trust_env,
                                           "_max_redirects": self.max_redirects, "_proxies": self.proxies}))
         status, body = self.endpoint.refresh
-        return types.SimpleNamespace(json=lambda: body, status_code=status)
+        return Answer(status, json.dumps(body).encode())
+
+
+class Answer:
+    """A streamed response: the refresh reads its body in bounded chunks (C9-SEC-58)."""
+
+    def __init__(self, status, raw):
+        self.status_code, self.raw = status, raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def iter_content(self, chunk_size=1):
+        for start in range(0, len(self.raw), chunk_size):
+            yield self.raw[start:start + chunk_size]
 
 
 class AppShim:
@@ -338,3 +355,11 @@ def test_custody_is_kept_behind_pylons_app_shim(make, flask, endpoint, signing_k
     module = make()
     sign_in(module, flask, endpoint, signing_key)
     assert KEY in redis.values and "OBO custody was not kept" not in log.everything()
+
+
+def test_an_oversized_refresh_answer_is_refused_without_reading_it_all(make, flask, endpoint, signing_key, redis):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    endpoint.refresh = (200, {"access_token": NEW_ACCESS, "padding": "x" * 70_000})
+    assert ask(module, TID, OID, refresh=True) == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
+    assert json.loads(redis.values[KEY])["access_token"] == ACCESS
