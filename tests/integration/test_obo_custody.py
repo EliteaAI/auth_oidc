@@ -65,6 +65,9 @@ class Redis:
     def get(self, key):
         return self.values.get(key)
 
+    def ttl(self, key):
+        return (self.ttls.get(key) or -1) if key in self.values else -2
+
     def delete(self, key):
         self.calls.append(("delete", key))
         self.values.pop(key, None)
@@ -269,6 +272,21 @@ def test_a_refresh_renews_once_through_a_hardened_request_and_keeps_the_custody_
     assert "refreshed" in "\n".join(log.lines())
     for secret in (ACCESS, NEW_ACCESS, REFRESH_TOKEN, NEW_REFRESH_TOKEN):
         assert secret not in log.everything()
+
+
+def test_the_answer_says_when_the_custody_ends_and_never_later_than_the_session_lifetime(
+        make, flask, endpoint, signing_key, redis):
+    """#7281: elitea_core keeps no token minted from a custody past the custody's own end (fixed at the sign-in)."""
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    answer = ask(module, TID, OID)
+    assert 0 <= (time.time() + 7 * 86400) - answer["custody_expires_at"] <= 2
+    refreshed = ask(module, TID, OID, refresh=True)   # a refresh keeps the end where the sign-in put it
+    assert refreshed["ok"] is True and refreshed["custody_expires_at"] == answer["custody_expires_at"]
+    redis.ttls[KEY] = 120   # the custody's own clock runs down: the answer follows it
+    assert 0 <= time.time() + 120 - ask(module, TID, OID)["custody_expires_at"] <= 2
+    del redis.values[KEY]
+    assert ask(module, TID, OID) == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
 
 
 def test_an_access_token_about_to_expire_is_refreshed_without_being_asked(make, flask, endpoint, signing_key, redis):

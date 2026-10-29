@@ -70,6 +70,9 @@ class Redis:
     def get(self, key):
         return self.values.get(key)
 
+    def ttl(self, key):
+        return (self.ttls.get(key) or -1) if key in self.values else -2
+
     def delete(self, key):
         self.calls.append(("delete", key))
         self.values.pop(key, None)
@@ -284,7 +287,10 @@ def test_a_brokered_sign_in_is_fetched_once_and_kept_as_the_same_record(make, fl
 def test_the_rpc_hands_the_brokered_assertion_to_main(make, flask, login_endpoint, http, signing_key):
     module = make()
     sign_in(module, flask, login_endpoint, signing_key)
-    assert module.obo_assertion(**signed(TID, OID)) == {"ok": True, "assertion": ENTRA_ACCESS, "expires_at": EXP}
+    answer = module.obo_assertion(**signed(TID, OID))
+    assert {key: answer[key] for key in ("ok", "assertion", "expires_at")} == {
+        "ok": True, "assertion": ENTRA_ACCESS, "expires_at": EXP}
+    assert set(answer) == {"ok", "assertion", "expires_at", "custody_expires_at"}   # when the custody ends (#7281)
 
 
 @pytest.mark.parametrize("access", [

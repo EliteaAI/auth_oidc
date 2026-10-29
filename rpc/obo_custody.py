@@ -32,12 +32,15 @@ class RPC:  # pylint: disable=R0903,E1101
     @web.rpc("auth_oidc_obo_assertion", "obo_assertion")
     def obo_assertion(self, tid, oid, refresh=False, iat=None, nonce=None, signature=None):  # pylint: disable=R0913
         """ The Entra access token of the person ``(tid, oid)``, for elitea_core's credential release to exchange:
-        ``{"ok": True, "assertion", "expires_at"}``, or ``{"ok": False, "code": "ASSERTION_UNAVAILABLE"}`` when no
+        ``{"ok": True, "assertion", "expires_at", "custody_expires_at"}``, or ``{"ok": False, "code":
+        "ASSERTION_UNAVAILABLE"}`` when no
         Microsoft sign-in of theirs is kept (signed out, expired, a login that is neither Entra's nor brokered to it,
         custody off) or it cannot be renewed. ``refresh``: renew it first with the stored refresh token (an exchange
         refused it as expired).
         ``iat``, ``nonce``, ``signature``: elitea_core's signature over the request (``obo_request_signed``); without
-        a good one the answer is ``REQUEST_REFUSED``. Never raises; never logs a token. """
+        a good one the answer is ``REQUEST_REFUSED``. ``custody_expires_at``: when the custody itself ends (epoch
+        seconds; its lifetime is fixed at the sign-in), so elitea_core keeps no token it minted from it past that
+        (#7281). Never raises; never logs a token. """
         try:
             store = self.obo_custody_store()
             key = self.obo_custody_key(tid, oid)
@@ -59,7 +62,9 @@ class RPC:  # pylint: disable=R0903,E1101
                     return dict(UNAVAILABLE)
                 store.set(key, json.dumps(record), keepttl=True)   # the custody's own lifetime is not extended
                 log.info("OBO custody refreshed")
-            return {"ok": True, "assertion": record["access_token"], "expires_at": record.get("expires_at")}
+            ttl = store.ttl(key)
+            return {"ok": True, "assertion": record["access_token"], "expires_at": record.get("expires_at"),
+                    "custody_expires_at": int(time.time()) + ttl if isinstance(ttl, int) and ttl > 0 else None}
         except Exception as exception:  # pylint: disable=W0703
             log.error("OBO assertion failed: %s", type(exception).__name__)
             return dict(UNAVAILABLE)
