@@ -138,7 +138,10 @@
             "role": "broker.read-token"
           }
         }
-      ]
+      ],
+      "attributes": {
+        "post.logout.redirect.uris": "http://localhost/forward-auth/auth_oidc/logout_callback"
+      }
     }
   ],
   "users": [
