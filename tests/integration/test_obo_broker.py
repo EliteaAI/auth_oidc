@@ -597,25 +597,31 @@ def test_the_custody_check_runs_after_discovery_fills_the_token_endpoint(make):
 
 # --- #7131: a brokered owner's offline consent ------------------------------------------------------------------------
 
-def _offline(fields):
-    iat, nonce = int(time.time()), secrets.token_urlsafe(16)
+def _offline(fields, nonce=None):
+    iat, nonce = int(time.time()), nonce or secrets.token_urlsafe(16)
     message = "|".join((*fields, str(iat), nonce)).encode()
     return {"iat": iat, "nonce": nonce, "signature": hmac.new(REQUEST_KEY.encode(), message, hashlib.sha256).hexdigest()}
 
 
 def test_a_brokered_owners_consent_and_its_redemption_go_to_the_entra_authority_with_the_web_client(
-        make, flask, login_endpoint, http, signing_key, log):
+        make, flask, login_endpoint, http, signing_key, log, custody_mod):
     module = make()
     sign_in(module, flask, login_endpoint, signing_key)
     holder = "mandate:6f1c1d1e-0000-4000-8000-000000000001"
     http.refresh = (200, {"access_token": NEW_ENTRA_ACCESS, "refresh_token": NEW_ENTRA_REFRESH, "expires_in": 3600})
-    answer = module.obo_offline_grant(tid=TID, oid=OID, holder=holder,
-                                      **_offline(("v1-offline-grant", TID, OID, holder)))
-    assert answer == {"ok": True, "refresh_token": NEW_ENTRA_REFRESH, "assertion_source": "broker"}
-    digest = hashlib.sha256(NEW_ENTRA_REFRESH.encode()).hexdigest()
+    key = custody_mod.seal_key(REQUEST_KEY)
+    request = {"tid": TID, "oid": OID, "holder": holder, **_offline(("v1-offline-grant", TID, OID, holder))}
+    answer = module.obo_offline_grant(**request)
+    assert (answer["ok"], answer["assertion_source"]) == (True, "broker")
+    token = custody_mod.open_sealed(key, answer["sealed_refresh_token"],
+                                    custody_mod.seal_aad("grant-reply", TID, OID, holder, request["nonce"]))
+    assert token == NEW_ENTRA_REFRESH
+    nonce = secrets.token_urlsafe(16)
+    sealed = custody_mod.seal(key, token, custody_mod.seal_aad("redeem-req", TID, OID, holder, nonce))
+    digest = hashlib.sha256(sealed.encode()).hexdigest()
     redeemed = module.obo_offline_assertion(
-        tid=TID, oid=OID, holder=holder, source="broker", refresh_token=NEW_ENTRA_REFRESH,
-        **_offline(("v1-offline", TID, OID, holder, "broker", digest)))
+        tid=TID, oid=OID, holder=holder, source="broker", sealed_refresh_token=sealed,
+        **_offline(("v1-offline", TID, OID, holder, "broker", digest), nonce=nonce))
     assert redeemed["ok"] is True and redeemed["assertion"] == NEW_ENTRA_ACCESS
     for url, kwargs in http.posts:
         assert url == f"https://login.microsoftonline.com/{TID}/oauth2/v2.0/token"   # never Keycloak's

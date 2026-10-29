@@ -128,6 +128,50 @@ def _read_bounded(response, limit, deadline):
     return b"".join(chunks)
 
 
+SEAL_INFO = b"elitea-obo-offline-seal-v1"   # the subkey of the request key that seals offline refresh tokens (#7131)
+SEAL_PREFIX = "s1."
+MAX_SEALED_CHARS = 2 * MAX_TOKEN_CHARS
+
+
+def seal_key(request_key):
+    """ A 32-byte AES-256-GCM key derived from the request key with HKDF-SHA256 (its own info string, so the sealing
+    key is never the HMAC key), or None without a request key """
+    if not request_key:
+        return None
+    from cryptography.hazmat.primitives import hashes  # pylint: disable=C0415,E0401
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF  # pylint: disable=C0415,E0401
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=SEAL_INFO).derive(request_key.encode("utf-8"))
+
+
+def seal_aad(direction, tid, oid, holder, nonce) -> bytes:
+    """ What a sealed refresh token is bound to: its direction and the request it belongs to """
+    return "|".join(("v1-seal", direction, tid, oid, holder, nonce)).encode("utf-8")
+
+
+def seal(key, plaintext, aad) -> str:
+    """ ``s1.<base64url(nonce || ciphertext)>``: AES-256-GCM, a fresh 96-bit nonce per message """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # pylint: disable=C0415,E0401
+    nonce = os.urandom(12)
+    sealed = nonce + AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), aad)
+    return SEAL_PREFIX + base64.urlsafe_b64encode(sealed).decode("ascii")
+
+
+def open_sealed(key, sealed, aad):
+    """ The plaintext of ``seal``, or None for anything that does not open with this key and binding """
+    if not key or not isinstance(sealed, str) or not sealed.startswith(SEAL_PREFIX) or \
+            len(sealed) > MAX_SEALED_CHARS:
+        return None
+    from cryptography.exceptions import InvalidTag  # pylint: disable=C0415,E0401
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # pylint: disable=C0415,E0401
+    try:
+        raw = base64.urlsafe_b64decode(sealed[len(SEAL_PREFIX):].encode("ascii"))
+        if len(raw) < 12 + 16:
+            return None
+        return AESGCM(key).decrypt(raw[:12], raw[12:], aad).decode("utf-8")
+    except (InvalidTag, ValueError, binascii.Error, UnicodeDecodeError):
+        return None
+
+
 class Method:  # pylint: disable=E1101,R0903
     """ Methods """
 
