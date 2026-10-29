@@ -425,3 +425,134 @@ def test_an_oversized_refresh_answer_is_refused_without_reading_it_all(make, fla
     endpoint.refresh = (200, {"access_token": NEW_ACCESS, "padding": "x" * 70_000})
     assert ask(module, TID, OID, refresh=True) == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
     assert json.loads(redis.values[KEY])["access_token"] == ACCESS
+
+
+# --- #7131: the offline consent of a mandate owner -------------------------------------------------------------------
+
+HOLDER = "mandate:6f1c1d1e-0000-4000-8000-000000000001"
+OFFLINE_REFRESH_TOKEN = "refresh-token-made-up-ffff"
+
+
+def signed_offline(fields, tid=TID, oid=OID, key=REQUEST_KEY, iat=None, nonce=None):
+    iat = int(time.time()) if iat is None else iat
+    nonce = nonce or secrets.token_urlsafe(16)
+    message = "|".join((*fields, str(iat), nonce)).encode()
+    return {"iat": iat, "nonce": nonce, "signature": hmac.new(key.encode(), message, hashlib.sha256).hexdigest()}
+
+
+def grant(module, tid=TID, oid=OID, **over):
+    request = {"tid": tid, "oid": oid, "holder": HOLDER,
+               **signed_offline(("v1-offline-grant", tid, oid, HOLDER), tid, oid)}
+    return module.obo_offline_grant(**{**request, **over})
+
+
+def redeem(module, refresh_token=OFFLINE_REFRESH_TOKEN, source="login", signed_token=None, **over):
+    """``over`` changes the request after it was signed (``source`` and ``refresh_token`` are signed as given)."""
+    digest = hashlib.sha256((signed_token or refresh_token).encode()).hexdigest()
+    request = {"tid": TID, "oid": OID, "holder": HOLDER, "source": source, "refresh_token": refresh_token,
+               **signed_offline(("v1-offline", TID, OID, HOLDER, source, digest))}
+    return module.obo_offline_assertion(**{**request, **over})
+
+
+def test_consent_hands_out_a_fresh_refresh_token_of_the_kept_sign_in_and_leaves_the_custody_alone(
+        make, flask, endpoint, signing_key, redis, log):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    kept = redis.values[KEY]
+    answer = grant(module)
+    assert answer == {"ok": True, "refresh_token": NEW_REFRESH_TOKEN, "assertion_source": "login"}
+    url, kwargs = endpoint.posts[-1]
+    assert url == f"https://login.microsoftonline.com/{TID}/oauth2/v2.0/token"
+    assert kwargs["data"]["grant_type"] == "refresh_token" and kwargs["data"]["refresh_token"] == REFRESH_TOKEN
+    assert (kwargs["allow_redirects"], kwargs["_trust_env"], kwargs["_max_redirects"]) == (False, False, 0)
+    assert redis.values[KEY] == kept   # the session's own custody is not touched
+    for secret in (ACCESS, NEW_ACCESS, REFRESH_TOKEN, NEW_REFRESH_TOKEN):
+        assert secret not in log.everything()
+
+
+@pytest.mark.parametrize("change", [
+    {"signature": "0" * 64},
+    {"holder": "mandate:6f1c1d1e-0000-4000-8000-000000000002"},   # signed for another mandate
+    {"holder": "user:9"},                                          # not a mandate
+    {"iat": int(time.time()) - 120},
+])
+def test_a_consent_request_elitea_core_did_not_sign_for_this_mandate_is_refused(
+        make, flask, endpoint, signing_key, change):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    assert grant(module, **change) == {"ok": False, "code": "REQUEST_REFUSED"}
+    assert endpoint.posts[1:] == []
+
+
+def test_a_custody_assertion_signature_never_opens_a_consent(make, flask, endpoint, signing_key):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    other = signed(TID, OID)   # a v1 assertion request of the same person
+    assert module.obo_offline_grant(tid=TID, oid=OID, holder=HOLDER, iat=other["iat"], nonce=other["nonce"],
+                                    signature=other["signature"]) == {"ok": False, "code": "REQUEST_REFUSED"}
+
+
+def test_a_consent_request_is_answered_once(make, flask, endpoint, signing_key):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    request = {"tid": TID, "oid": OID, "holder": HOLDER, **signed_offline(("v1-offline-grant", TID, OID, HOLDER))}
+    assert module.obo_offline_grant(**request)["ok"] is True
+    assert module.obo_offline_grant(**request) == {"ok": False, "code": "REQUEST_REFUSED"}
+
+
+def test_consent_without_a_kept_sign_in_or_its_refresh_token_or_a_working_refresh_is_unavailable(
+        make, flask, endpoint, signing_key, redis):
+    module = make()
+    assert grant(module) == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}   # never signed in
+    sign_in(module, flask, endpoint, signing_key)
+    endpoint.refresh = (400, {"error": "invalid_grant"})
+    assert grant(module) == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
+    record = json.loads(redis.values[KEY])
+    redis.values[KEY] = json.dumps({**record, "refresh_token": None})
+    assert grant(module) == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
+    assert grant(module, oid="someone-else") == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
+
+
+def test_an_offline_refresh_token_is_redeemed_for_the_persons_assertion_and_its_rotation_returned(
+        make, endpoint, log, redis):
+    module = make()
+    answer = redeem(module)
+    assert answer["ok"] is True and answer["assertion"] == NEW_ACCESS and answer["refresh_token"] == NEW_REFRESH_TOKEN
+    url, kwargs = endpoint.posts[-1]
+    assert url == f"https://login.microsoftonline.com/{TID}/oauth2/v2.0/token"
+    assert kwargs["data"]["refresh_token"] == OFFLINE_REFRESH_TOKEN
+    assert [key for key in redis.values if ":nonce:" not in key] == []   # nothing is kept
+    endpoint.refresh = (200, {"access_token": NEW_ACCESS, "expires_in": 3600})   # no rotation
+    assert redeem(module)["refresh_token"] is None
+    for secret in (NEW_ACCESS, OFFLINE_REFRESH_TOKEN, NEW_REFRESH_TOKEN):
+        assert secret not in log.everything()
+
+
+@pytest.mark.parametrize("answer, code", [
+    ((400, {"error": "invalid_grant"}), "CONSENT_REFUSED"),            # expired or revoked at Microsoft: definitive
+    ((400, {"error": "invalid_client"}), "ASSERTION_UNAVAILABLE"),     # the client, not the consent
+    ((503, {}), "ASSERTION_UNAVAILABLE"),
+    ((200, {"access_token": jwt(iss=ENTRA, tid=TID, oid="someone-else", aud="api-client"), "expires_in": 3600}),
+     "ASSERTION_UNAVAILABLE"),                                          # another person's token is never handed out
+])
+def test_a_refused_redemption_says_whether_the_consent_itself_is_gone(make, endpoint, answer, code):
+    endpoint.refresh = answer
+    assert redeem(make()) == {"ok": False, "code": code}
+
+
+@pytest.mark.parametrize("change", [
+    {"signed_token": "refresh-token-made-up-other"},   # the signature names another refresh token
+    {"source": "keycloak"},                            # not a custody source
+    {"holder": "mandate:not-a-uuid"},
+])
+def test_a_redemption_elitea_core_did_not_sign_for_this_token_is_refused(make, endpoint, change):
+    assert redeem(make(), **change) == {"ok": False, "code": "REQUEST_REFUSED"}
+    assert endpoint.posts == []
+
+
+def test_without_custody_configured_nothing_is_redeemed(make, endpoint, monkeypatch):
+    module = make()
+    monkeypatch.delenv("ELITEA_OBO_CUSTODY_KEY")
+    assert redeem(module) == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
+    assert redeem(make(obo_custody_enabled=False)) == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
+    assert endpoint.posts == []

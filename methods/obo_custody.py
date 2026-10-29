@@ -136,12 +136,19 @@ class Method:  # pylint: disable=E1101,R0903
         """ Did elitea_core ask (the request key is shared with it only), recently, and only once? A worker that merely
         reaches the RPC bus cannot ask for anyone's assertion. (The answer to elitea_core's own request crosses the bus
         like the token the identity verifier reads at every admission.) The nonce is spent in the session Redis. """
+        return self.obo_signed(store, tid, oid, ("v1", tid, oid, "1" if refresh else "0"), iat, nonce, signature)
+
+    @web.method()
+    def obo_signed(self, store, tid, oid, fields, iat, nonce, signature):  # pylint: disable=R0913
+        """ The check of every signed request: HMAC-SHA256 with the shared request key over ``fields`` (a version tag
+        first, so a request of one kind never verifies as another), then ``iat`` and ``nonce``; recent, and the nonce
+        spent once under the person's key prefix. """
         key = self.obo_request_key()
         if not key or not isinstance(signature, str) or not isinstance(nonce, str) \
                 or not _NONCE.match(nonce) or isinstance(iat, bool) or not isinstance(iat, int) \
                 or abs(time.time() - iat) > REQUEST_MAX_AGE_S:
             return False
-        message = "|".join(("v1", tid, oid, "1" if refresh else "0", str(iat), nonce)).encode("utf-8")
+        message = "|".join((*fields, str(iat), nonce)).encode("utf-8")
         expected = hmac.new(key.encode("utf-8"), message, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, signature):
             return False
@@ -389,13 +396,21 @@ class Method:  # pylint: disable=E1101,R0903
         hardened request (https, the configured token endpoint's host only — for a brokered record the Entra
         authority of its tenant with the obo_broker_refresh client —, no redirect, no proxy from the environment, a
         timeout). The updated record, or None. """
+        return self.refresh_obo_record(record)[0]
+
+    @web.method()
+    def refresh_obo_record(self, record):  # pylint: disable=R0914
+        """ ``refresh_obo_custody`` that also says why it failed: ``(updated record, False)``, ``(None, True)`` when
+        the authority refused the refresh token itself (``invalid_grant``: expired, revoked or consent withdrawn at
+        Microsoft — a definitive answer), ``(None, False)`` for anything else (not configured, unreachable, a
+        malformed or foreign answer: it may work later). """
         refresh_token = record.get("refresh_token")
         config = self.descriptor.config
         if record.get("assertion_source") == "broker":
             # the record came through Keycloak; its refresh token is Entra's, for the client Keycloak brokers through
             client, tid = self.obo_broker_refresh_client(), record.get("tid")
             if not refresh_token or client is None or not isinstance(tid, str) or not _GUID.match(tid):
-                return None
+                return None, False
             endpoint, auth, valid = f"https://{AUTHORITY_HOST}/{tid}/oauth2/v2.0/token", None, broker_token_of
             data = {"grant_type": "refresh_token", "refresh_token": refresh_token, "scope": client[2],
                     "client_id": client[0], "client_secret": client[1]}
@@ -404,7 +419,7 @@ class Method:  # pylint: disable=E1101,R0903
             parts = urlsplit(endpoint or "")
             if not refresh_token or parts.scheme != "https" or parts.hostname != AUTHORITY_HOST or \
                     parts.port not in (None, 443):
-                return None   # custody is Entra-only, so its refresh goes to the Entra authority only
+                return None, False   # custody is Entra-only, so its refresh goes to the Entra authority only
             data = {"grant_type": "refresh_token", "refresh_token": refresh_token,
                     "scope": config.get("scope", config.get("target_scope", "openid profile email"))}
             auth = None
@@ -419,18 +434,20 @@ class Method:  # pylint: disable=E1101,R0903
                                         verify=True, stream=True)
                 with response:
                     status = response.status_code
-                    raw = _read_bounded(response, MAX_TOKEN_RESPONSE_BYTES, deadline) if status == 200 else None
+                    raw = _read_bounded(response, MAX_TOKEN_RESPONSE_BYTES, deadline) if status in (200, 400) \
+                        else None
             body = json.loads(raw) if raw is not None else None
         except Exception as exception:  # pylint: disable=W0703
             log.error("OBO custody refresh failed: %s", type(exception).__name__)
-            return None
-        if not isinstance(body, dict) or not valid(body.get("access_token"), record["tid"], record["oid"],
-                                                   config.get("obo_api_client_id")):
-            log.warning("OBO custody refresh was refused (status %s)", status)
-            return None
+            return None, False
+        if status != 200 or not isinstance(body, dict) or not valid(
+                body.get("access_token"), record["tid"], record["oid"], config.get("obo_api_client_id")):
+            refused = status == 400 and isinstance(body, dict) and body.get("error") == "invalid_grant"
+            log.warning("OBO custody refresh was refused (status %s%s)", status, ", invalid_grant" if refused else "")
+            return None, refused
         try:
             expires_at = int(time.time()) + int(body.get("expires_in"))
         except (TypeError, ValueError):
             expires_at = None
         return {**record, "access_token": body["access_token"],
-                "refresh_token": body.get("refresh_token") or refresh_token, "expires_at": expires_at}
+                "refresh_token": body.get("refresh_token") or refresh_token, "expires_at": expires_at}, False

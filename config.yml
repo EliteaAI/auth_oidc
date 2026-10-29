@@ -44,6 +44,10 @@ client_secret: ""
 # here; give it to pylon_auth and pylon_main only, never through an env file every pylon loads). obo_api_client_id is
 # the platform API's client id: only a sign-in token for it is kept. Missing key or id: nothing is kept (ERROR at init).
 # Custody lives as long as the session does.
+# Autonomous mandates (#7131): with custody on, a mandate owner's consent asks (RPC auth_oidc_obo_offline_grant) for one
+# refresh of the kept sign-in and hands its refresh token to elitea_core, which keeps it as the owner's offline material;
+# a mandate run redeems it (RPC auth_oidc_obo_offline_assertion) with the same client as the custody refresh. Both are
+# signed with the same key; nothing more to configure. Logout does not end a consent (it is offline by design).
 # obo_custody_enabled: false
 # obo_api_client_id: <platform API client id>
 # obo_custody_key_env: ELITEA_OBO_CUSTODY_KEY
