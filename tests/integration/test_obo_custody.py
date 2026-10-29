@@ -52,8 +52,8 @@ class Redis:
     def __init__(self):
         self.values, self.ttls, self.calls = {}, {}, []
 
-    def set(self, key, value, ex=None, keepttl=False, nx=False):
-        if nx and key in self.values:
+    def set(self, key, value, ex=None, keepttl=False, nx=False, xx=False):
+        if (nx and key in self.values) or (xx and key not in self.values):
             return None
         if ":nonce:" not in key:
             self.calls.append(("set", key, ex, keepttl))
@@ -65,9 +65,31 @@ class Redis:
     def get(self, key):
         return self.values.get(key)
 
+    def ttl(self, key):
+        return (self.ttls.get(key) or -1) if key in self.values else -2
+
+    def pipeline(self, transaction=True):
+        return Pipeline(self)
+
     def delete(self, key):
         self.calls.append(("delete", key))
         self.values.pop(key, None)
+
+
+class Pipeline:
+    """MULTI/EXEC as the RPC uses it: the queued reads answered together."""
+
+    def __init__(self, redis):
+        self.redis, self.queued = redis, []
+
+    def get(self, key):
+        self.queued.append(("get", key))
+
+    def ttl(self, key):
+        self.queued.append(("ttl", key))
+
+    def execute(self):
+        return [getattr(self.redis, name)(key) for name, key in self.queued]
 
 
 class TokenEndpoint:
@@ -269,6 +291,46 @@ def test_a_refresh_renews_once_through_a_hardened_request_and_keeps_the_custody_
     assert "refreshed" in "\n".join(log.lines())
     for secret in (ACCESS, NEW_ACCESS, REFRESH_TOKEN, NEW_REFRESH_TOKEN):
         assert secret not in log.everything()
+
+
+def test_the_answer_says_when_the_custody_ends_and_never_later_than_the_session_lifetime(
+        make, flask, endpoint, signing_key, redis):
+    """#7281: elitea_core keeps no token minted from a custody past the custody's own end (fixed at the sign-in)."""
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    answer = ask(module, TID, OID)
+    assert 0 <= (time.time() + 7 * 86400) - answer["custody_expires_at"] <= 2
+    refreshed = ask(module, TID, OID, refresh=True)   # a refresh keeps the end where the sign-in put it
+    assert refreshed["ok"] is True and refreshed["custody_expires_at"] == answer["custody_expires_at"]
+    redis.ttls[KEY] = 120   # the custody's own clock runs down: the answer follows it
+    assert 0 <= time.time() + 120 - ask(module, TID, OID)["custody_expires_at"] <= 2
+    del redis.values[KEY]
+    assert ask(module, TID, OID) == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
+
+
+def test_a_custody_that_ends_between_the_reads_or_has_no_lifetime_never_lets_main_keep_a_token(
+        make, flask, endpoint, signing_key, redis, monkeypatch):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    monkeypatch.setattr(redis, "ttl", lambda key: -2)   # gone between the record read and its lifetime
+    assert ask(module, TID, OID) == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
+    monkeypatch.setattr(redis, "ttl", lambda key: -1)   # no lifetime at all: treated as ending now
+    assert 0 <= time.time() - ask(module, TID, OID)["custody_expires_at"] <= 2
+
+
+def test_a_refresh_does_not_bring_back_a_custody_that_ended_meanwhile(make, flask, endpoint, signing_key, redis,
+                                                                         monkeypatch):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    real_refresh = module.refresh_obo_custody
+
+    def refresh_while_it_ends(record):
+        redis.values.pop(KEY, None)   # the custody expires while the refresh is on the wire
+        return real_refresh(record)
+
+    monkeypatch.setattr(module, "refresh_obo_custody", refresh_while_it_ends)
+    assert ask(module, TID, OID, refresh=True) == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
+    assert KEY not in redis.values   # not written back without a lifetime
 
 
 def test_an_access_token_about_to_expire_is_refreshed_without_being_asked(make, flask, endpoint, signing_key, redis):
