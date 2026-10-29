@@ -61,6 +61,11 @@ Keycloak. `check_realm.py` fails a realm in which anything else could set them.
    people (not in the default roles, not by "Stored tokens readable", not through a group or role): every other
    application's tokens would then carry it too and could read the person's Entra tokens. If your realm already grants
    it that way, remove it there.
+6. **Clients → `<Elitea's client>` → Settings → Valid post logout redirect URIs**: Elitea's logout callback
+   (`<Elitea base URL>/forward-auth/auth_oidc/logout_callback`). Without it Keycloak refuses Elitea's logout
+   ("Invalid redirect uri") and the platform session is not ended. Note that a logout through Keycloak is forwarded to
+   Entra as well (the broker's upstream logout): the person's Microsoft browser session ends with it, and the next
+   sign-in asks for credentials again.
 
 **Check the realm.** Export it (Realm settings → Action → Partial export, include groups and roles and clients) and run:
 
