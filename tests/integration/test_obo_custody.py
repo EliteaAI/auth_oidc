@@ -440,25 +440,27 @@ def signed_offline(fields, key=REQUEST_KEY, iat=None, nonce=None):
     return {"iat": iat, "nonce": nonce, "signature": hmac.new(key.encode(), message, hashlib.sha256).hexdigest()}
 
 
-def grant(module, tid=TID, oid=OID, **over):
-    request = {"tid": tid, "oid": oid, "holder": HOLDER, **signed_offline(("v1-offline-grant", tid, oid, HOLDER))}
+def grant(module, tid=TID, oid=OID, signed_holder=HOLDER, **over):
+    """``over`` changes the request after it was signed (``signed_holder`` is signed and sent as given)."""
+    request = {"tid": tid, "oid": oid, "holder": signed_holder,
+               **signed_offline(("v1-offline-grant", tid, oid, signed_holder))}
     return module.obo_offline_grant(**{**request, **over}), request
 
 
-def opened(custody_mod, sealed, direction, nonce, key=REQUEST_KEY):
+def opened(custody_mod, sealed, direction, nonce, key=REQUEST_KEY, holder=HOLDER):
     return custody_mod.open_sealed(custody_mod.seal_key(key), sealed,
-                                   custody_mod.seal_aad(direction, TID, OID, HOLDER, nonce))
+                                   custody_mod.seal_aad(direction, TID, OID, holder, nonce))
 
 
 def redeem(module, custody_mod, refresh_token=OFFLINE_REFRESH_TOKEN, source="login", seal_with=REQUEST_KEY,
-           signed_sealed=None, **over):
-    """``over`` changes the request after it was signed (``source`` is signed as given)."""
+           signed_sealed=None, holder=HOLDER, **over):
+    """``over`` changes the request after it was signed (``source`` and ``holder`` are signed as given)."""
     nonce = secrets.token_urlsafe(16)
     sealed = custody_mod.seal(custody_mod.seal_key(seal_with), refresh_token,
-                              custody_mod.seal_aad("redeem-req", TID, OID, HOLDER, nonce))
+                              custody_mod.seal_aad("redeem-req", TID, OID, holder, nonce))
     digest = hashlib.sha256((signed_sealed or sealed).encode()).hexdigest()
-    request = {"tid": TID, "oid": OID, "holder": HOLDER, "source": source, "sealed_refresh_token": sealed,
-               **signed_offline(("v1-offline", TID, OID, HOLDER, source, digest), nonce=nonce)}
+    request = {"tid": TID, "oid": OID, "holder": holder, "source": source, "sealed_refresh_token": sealed,
+               **signed_offline(("v1-offline", TID, OID, holder, source, digest), nonce=nonce)}
     request.update(over)
     return module.obo_offline_assertion(**request), request
 
@@ -596,3 +598,51 @@ def test_without_custody_configured_nothing_is_redeemed(make, endpoint, monkeypa
     assert redeem(module, custody_mod)[0] == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
     assert redeem(make(obo_custody_enabled=False), custody_mod)[0] == {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
     assert endpoint.posts == []
+
+
+# --- #7337: a scoped API token as the holder -------------------------------------------------------------------------
+
+TOKEN_HOLDER = "token:76"
+MALFORMED_HOLDERS = ["token:", "token:0", "token:abc", "token:1:2", "mandate:token:1", "token:01", "token:-1",
+                     "token:12345678901", " token:1", "token:1 ", "Token:1", "user:9"]
+
+
+def test_a_token_holder_gets_a_consent_sealed_for_that_token_only(make, flask, endpoint, signing_key, custody_mod):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    answer, request = grant(module, signed_holder=TOKEN_HOLDER)
+    assert answer["ok"] is True
+    assert opened(custody_mod, answer["sealed_refresh_token"], "grant-reply", request["nonce"],
+                  holder=TOKEN_HOLDER) == NEW_REFRESH_TOKEN
+    for other in (HOLDER, "token:77"):   # the seal is bound to the holder
+        assert opened(custody_mod, answer["sealed_refresh_token"], "grant-reply", request["nonce"], holder=other) is None
+
+
+def test_a_token_holders_consent_is_redeemed_and_its_rotation_sealed_for_it(make, endpoint, custody_mod):
+    answer, request = redeem(make(), custody_mod, holder=TOKEN_HOLDER)
+    assert answer["ok"] is True and answer["assertion"] == NEW_ACCESS
+    assert opened(custody_mod, answer["sealed_refresh_token"], "redeem-reply", request["nonce"],
+                  holder=TOKEN_HOLDER) == NEW_REFRESH_TOKEN
+    assert opened(custody_mod, answer["sealed_refresh_token"], "redeem-reply", request["nonce"]) is None
+
+
+@pytest.mark.parametrize("holder", MALFORMED_HOLDERS)
+def test_a_malformed_holder_is_refused_at_the_grant_and_the_redemption_even_when_signed(
+        make, flask, endpoint, signing_key, custody_mod, holder):
+    module = make()
+    sign_in(module, flask, endpoint, signing_key)
+    posted = len(endpoint.posts)
+    assert grant(module, signed_holder=holder)[0] == {"ok": False, "code": "REQUEST_REFUSED"}
+    assert redeem(module, custody_mod, holder=holder)[0] == {"ok": False, "code": "REQUEST_REFUSED"}
+    assert endpoint.posts[posted:] == []
+
+
+def test_a_token_redemption_sealed_for_a_mandate_does_not_open(make, endpoint, custody_mod):
+    nonce = secrets.token_urlsafe(16)
+    sealed = custody_mod.seal(custody_mod.seal_key(REQUEST_KEY), OFFLINE_REFRESH_TOKEN,
+                              custody_mod.seal_aad("redeem-req", TID, OID, HOLDER, nonce))   # sealed for the mandate
+    digest = hashlib.sha256(sealed.encode()).hexdigest()
+    answer = make().obo_offline_assertion(
+        tid=TID, oid=OID, holder=TOKEN_HOLDER, source="login", sealed_refresh_token=sealed,
+        **signed_offline(("v1-offline", TID, OID, TOKEN_HOLDER, "login", digest), nonce=nonce))
+    assert answer == {"ok": False, "code": "REQUEST_REFUSED"} and endpoint.posts == []
