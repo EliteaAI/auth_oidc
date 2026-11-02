@@ -31,8 +31,9 @@ from ..methods.obo_custody import (
 
 UNAVAILABLE = {"ok": False, "code": "ASSERTION_UNAVAILABLE"}
 REFUSED = {"ok": False, "code": "REQUEST_REFUSED"}
-# what an offline grant is bound to: one autonomous mandate (elitea_core's ``mandate:<uuid>``)
-HOLDER = re.compile(r"^mandate:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+# what an offline grant is bound to: one autonomous mandate (elitea_core's ``mandate:<uuid>``, #7131) or one scoped API
+# token (``token:<id>``, a positive id, #7337); the holder is signed by elitea_core and bound into every seal
+HOLDER = re.compile(r"^(mandate:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|token:[1-9][0-9]{0,9})$")
 OFFLINE_SOURCES = ("login", "broker")   # the custody record's own ``assertion_source``: which client redeems it
 
 
@@ -95,7 +96,7 @@ class RPC:  # pylint: disable=R0903,E1101
     def obo_offline_grant(self, tid, oid, holder, iat=None, nonce=None, signature=None):  # pylint: disable=R0913
         """ The mandate owner consents (#7131): from the custody of their current Microsoft sign-in, one refresh of
         the stored refresh token, whose new refresh token is handed to elitea_core to keep as the owner's offline
-        material for ``holder`` (``mandate:<uuid>``). ``{"ok": True, "sealed_refresh_token", "assertion_source"}``:
+        material for ``holder`` (``mandate:<uuid>``, or ``token:<id>`` for a scoped API token, #7337). ``{"ok": True, "sealed_refresh_token", "assertion_source"}``:
         the token sealed (AES-256-GCM, a subkey of the request key, bound to ``grant-reply`` and this request), never in
         plain text on the bus; or ``{"ok": False, "code": ASSERTION_UNAVAILABLE | REQUEST_REFUSED}`` (no kept sign-in or
         no refresh token in it, the refresh refused; a request elitea_core did not sign over
@@ -129,7 +130,7 @@ class RPC:  # pylint: disable=R0903,E1101
     @web.rpc("auth_oidc_obo_offline_assertion", "obo_offline_assertion")
     def obo_offline_assertion(  # pylint: disable=R0913
             self, tid, oid, holder, source, sealed_refresh_token, iat=None, nonce=None, signature=None):
-        """ The assertion of a mandate run (#7131): the owner's offline refresh token (``obo_offline_grant``), sealed by
+        """ The assertion of a mandate run (#7131) or a scoped API token's run (#7337): the owner's offline refresh token (``obo_offline_grant``), sealed by
         elitea_core for this request (``redeem-req``), redeemed with the client of its ``source`` for an Entra access
         token of exactly ``(tid, oid)`` for the platform API. ``{"ok": True, "assertion", "expires_at",
         "sealed_refresh_token"}`` (the rotated token sealed for ``redeem-reply``, or None when the authority issued
